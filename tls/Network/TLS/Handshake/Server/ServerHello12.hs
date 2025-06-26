@@ -130,6 +130,24 @@ sendServerFirstFlight ServerParams{..} ctx usedCipher mcred chExts = do
             Nothing -> b1
             Just kx -> b1 . (ServerKeyXchg kx :)
 
+    -- Send OCSP CertificateStatus if client requested it and server provides response
+    -- Also handle must-staple certificate validation
+    b3 <- if hasStatusRequest chExts
+        then do
+            mOcspResponse <- onCertificateStatus serverHooks
+            case mOcspResponse of
+                Just ocspDer -> return $ b2 . (CertificateStatus ocspDer :)
+                Nothing -> do
+                    -- Check if certificate requires OCSP stapling (must-staple)
+                    if certificateChainRequiresStapling cc
+                        then throwCore $ Error_Protocol "certificate requires OCSP stapling but no OCSP response provided" CertificateRequired
+                        else return b2
+        else do
+            -- Client didn't request OCSP but check if certificate requires it (must-staple)
+            if certificateChainRequiresStapling cc
+                then throwCore $ Error_Protocol "certificate requires OCSP stapling but client did not request it" CertificateRequired
+                else return b2
+
     -- FIXME we don't do this on a Anonymous server
 
     -- When configured, send a certificate request with the DNs of all
@@ -148,8 +166,8 @@ sendServerFirstFlight ServerParams{..} ctx usedCipher mcred chExts = do
                         hashSigs
                         (map extractCAname serverCACertificates)
             usingHState ctx $ setCertReqSent True
-            return $ b2 . (creq :)
-        else return b2
+            return $ b3 . (creq :)
+        else return b3
   where
     commonGroups = negotiatedGroupsInCommon (supportedGroups serverSupported) chExts
     commonHashSigs = hashAndSignaturesInCommon (supportedHashSignatures serverSupported) chExts
@@ -321,3 +339,7 @@ negotiatedGroupsInCommon serverGroups chExts =
         common
   where
     common (SupportedGroups clientGroups) = serverGroups `intersect` clientGroups
+
+-- | Check if client requested OCSP stapling via status_request extension
+hasStatusRequest :: [ExtensionRaw] -> Bool
+hasStatusRequest exts = lookupAndDecode EID_StatusRequest MsgTClientHello exts False (const True :: StatusRequest -> Bool)

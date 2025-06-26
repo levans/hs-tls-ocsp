@@ -176,6 +176,7 @@ decodeHandshake cp ty = runGetErr ("handshake[" ++ show ty ++ "]") $ case ty of
     HandshakeType_CertVerify       -> decodeCertVerify cp
     HandshakeType_ClientKeyXchg    -> decodeClientKeyXchg cp
     HandshakeType_Finished         -> decodeFinished
+    HandshakeType_CertificateStatus -> decodeCertificateStatus
     x -> fail $ "Unsupported HandshakeType " ++ show x
 {- FOURMOLU_ENABLE -}
 
@@ -344,6 +345,12 @@ decodeClientKeyXchg cp =
 decodeFinished :: Get Handshake
 decodeFinished = Finished . VerifyData <$> (remaining >>= getBytes)
 
+decodeCertificateStatus :: Get Handshake
+decodeCertificateStatus = do
+    statusType <- getWord8
+    when (statusType /= 1) $ fail "unknown certificate status type"
+    CertificateStatus <$> getOpaque16
+
 ----------------------------------------------------------------
 -- encode HANDSHAKE
 
@@ -403,6 +410,9 @@ encodeHandshake' (ClientKeyXchg ckx) = runPut $ do
         CKX_DH clientDHPublic -> putInteger16 $ dhUnwrapPublic clientDHPublic
         CKX_ECDH bytes -> putOpaque8 bytes
 encodeHandshake' (Finished (VerifyData opaque)) = runPut $ putBytes opaque
+encodeHandshake' (CertificateStatus der) = runPut $ do
+    putWord8 0x01  -- status_type = ocsp
+    putOpaque16 der
 
 ------------------------------------------------------------
 -- CA distinguished names

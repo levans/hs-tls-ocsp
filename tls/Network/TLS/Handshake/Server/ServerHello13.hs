@@ -231,7 +231,26 @@ sendServerHello13 sparams ctx clientKeyShare (usedCipher, usedHash, rtt0) (early
             usingHState ctx $ setCertReqSent True
 
         let CertificateChain cs = certChain
-            ess = replicate (length cs) []
+        -- Build per-certificate extensions, including OCSP response if available
+        -- Also handle must-staple certificate validation
+        ess <- if hasStatusRequest chExtensions && not (null cs)
+            then do
+                mOcspResponse <- liftIO $ onCertificateStatus (serverHooks sparams)
+                case mOcspResponse of
+                    Just ocspDer ->
+                        -- Add OCSP extension to the leaf certificate only
+                        let ocspExt = ExtensionRaw EID_StatusRequest ocspDer
+                         in return $ [ocspExt] : replicate (length cs - 1) []
+                    Nothing -> do
+                        -- Check if certificate requires OCSP stapling (must-staple)
+                        if certificateChainRequiresStapling certChain
+                            then liftIO $ throwCore $ Error_Protocol "certificate requires OCSP stapling but no OCSP response provided" CertificateRequired
+                            else return $ replicate (length cs) []
+            else do
+                -- Client didn't request OCSP but check if certificate requires it (must-staple)
+                if not (null cs) && certificateChainRequiresStapling certChain
+                    then liftIO $ throwCore $ Error_Protocol "certificate requires OCSP stapling but client did not request it" CertificateRequired
+                    else return $ replicate (length cs) []
         let certtag = if zlib then CompressedCertificate13 else Certificate13
         loadPacket13 ctx $
             Handshake13 [certtag "" (CertificateChain_ certChain) ess]
@@ -380,3 +399,7 @@ makeHRR ctx usedCipher usedHash session g True = do
             , shComp = 0
             , shExtensions = extensions
             }
+
+-- | Check if client requested OCSP stapling via status_request extension  
+hasStatusRequest :: [ExtensionRaw] -> Bool
+hasStatusRequest exts = lookupAndDecode EID_StatusRequest MsgTClientHello exts False (const True :: StatusRequest -> Bool)

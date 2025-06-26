@@ -152,6 +152,7 @@ test-suite spec
         ECHSpec
         EncodeSpec
         HandshakeSpec
+        MustStapleSpec
         PipeChan
         PubKey
         Run
@@ -164,6 +165,7 @@ test-suite spec
     build-depends:
         base >=4.9 && <5,
         QuickCheck,
+        asn1-encoding,
         asn1-types,
         async,
         base64-bytestring,

@@ -70,6 +70,7 @@ module Network.TLS.Extension (
     SecureRenegotiation (..),
     ApplicationLayerProtocolNegotiation (..),
     ExtendedMainSecret (..),
+    StatusRequest (..),
     CertificateCompressionAlgorithm (.., CCA_Zlib, CCA_Brotli, CCA_Zstd),
     CompressCertificate (..),
     SupportedGroups (..),
@@ -675,6 +676,34 @@ instance Extension ExtendedMainSecret where
     extensionDecode MsgTClientHello "" = Just ExtendedMainSecret
     extensionDecode MsgTServerHello "" = Just ExtendedMainSecret
     extensionDecode _ _ = error "extensionDecode: ExtendedMainSecret"
+
+------------------------------------------------------------
+
+-- | Status request extension for OCSP stapling (RFC 6066 Section 8)
+data StatusRequest = StatusRequest
+    deriving (Show, Eq)
+
+instance Extension StatusRequest where
+    extensionID _ = EID_StatusRequest
+    extensionEncode StatusRequest = runPut $ do
+        putWord8 1      -- status_type = ocsp
+        putWord16 0     -- responder_id_list length (empty)
+        putWord16 0     -- request_extensions length (empty)
+    extensionDecode MsgTClientHello = decodeStatusRequest
+    extensionDecode MsgTServerHello = decodeStatusRequest
+    extensionDecode _ = error "extensionDecode: StatusRequest"
+
+decodeStatusRequest :: ByteString -> Maybe StatusRequest
+decodeStatusRequest = runGetMaybe $ do
+    statusType <- getWord8
+    when (statusType /= 1) $ fail "unsupported status type"
+    responderIdLen <- getWord16
+    _ <- getBytes (fromIntegral responderIdLen)  -- skip responder ID list
+    requestExtLen <- getWord16
+    _ <- getBytes (fromIntegral requestExtLen)   -- skip request extensions
+    leftoverLen <- remaining
+    when (leftoverLen /= 0) $ fail "decodeStatusRequest: broken length"
+    return StatusRequest
 
 ------------------------------------------------------------
 
