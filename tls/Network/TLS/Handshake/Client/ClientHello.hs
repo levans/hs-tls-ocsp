@@ -34,6 +34,12 @@ import Network.TLS.Types
 
 ----------------------------------------------------------------
 
+-- Polyfill for uniformByteString using genByteString from random-1.2.1.3
+uniformByteString :: RandomGen g => Int -> g -> (B.ByteString, g)
+uniformByteString = genByteString
+
+----------------------------------------------------------------
+
 sendClientHello
     :: ClientParams
     -> Context
