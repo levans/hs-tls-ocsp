@@ -550,6 +550,16 @@ data ClientHooks = ClientHooks
     --   See RFC 7919 section 3.1 for recommandations.
     , onServerFinished :: Information -> IO ()
     -- ^ When a handshake is done, this hook can check `Information`.
+    , onServerCertificateStatus :: CertificateChain -> ByteString -> IO CertificateUsage
+    -- ^ Called when the server provides an OCSP response for certificate stapling.
+    -- The first parameter is the server's certificate chain being validated.
+    -- The second parameter is the DER-encoded OCSP response from the server.
+    -- Return 'CertificateUsageAccept' to accept the certificate, or
+    -- 'CertificateUsageReject' with a reason to reject it.
+    -- This allows the client to validate the OCSP response and enforce
+    -- certificate revocation policies.
+    --
+    -- Default: 'return CertificateUsageAccept' (accept any OCSP response)
     }
 
 defaultClientHooks :: ClientHooks
@@ -560,6 +570,7 @@ defaultClientHooks =
         , onSuggestALPN = return Nothing
         , onCustomFFDHEGroup = defaultGroupUsage 1024
         , onServerFinished = \_ -> return ()
+        , onServerCertificateStatus = \_ _ -> return CertificateUsageAccept
         }
 
 instance Show ClientHooks where
@@ -648,7 +659,9 @@ defaultServerHooks =
                 CertificateUsageReject $
                     CertificateRejectOther "no client certificates expected"
         , onUnverifiedClientCert = return False
-        , onCipherChoosing = \_ -> head
+        , onCipherChoosing = \_ ccs -> case ccs of
+            [] -> error "onCipherChoosing: no compatible ciphers - configuration error"  
+            c : _ -> c
         , onServerNameIndication = \_ -> return mempty
         , onNewHandshake = \_ -> return True
         , onALPNClientSuggest = Nothing

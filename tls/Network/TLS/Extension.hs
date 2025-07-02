@@ -167,7 +167,7 @@ instance Extension ServerName where
     extensionDecode MsgTClientHello = decodeServerName
     extensionDecode MsgTServerHello = decodeServerName
     extensionDecode MsgTEncryptedExtensions = decodeServerName
-    extensionDecode _ = error "extensionDecode: ServerName"
+    extensionDecode _ = const Nothing
 
 decodeServerName :: ByteString -> Maybe ServerName
 decodeServerName = runGetMaybe $ do
@@ -217,7 +217,7 @@ instance Extension MaxFragmentLength where
     extensionDecode MsgTClientHello = decodeMaxFragmentLength
     extensionDecode MsgTServerHello = decodeMaxFragmentLength
     extensionDecode MsgTEncryptedExtensions = decodeMaxFragmentLength
-    extensionDecode _ = error "extensionDecode: MaxFragmentLength"
+    extensionDecode _ = const Nothing
 
 decodeMaxFragmentLength :: ByteString -> Maybe MaxFragmentLength
 decodeMaxFragmentLength = runGetMaybe $ toMaxFragmentEnum <$> getWord8

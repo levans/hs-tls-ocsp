@@ -39,6 +39,8 @@ module Network.TLS.Handshake.State (
     getCertReqCBdata,
     setCertReqSigAlgsCert,
     getCertReqSigAlgsCert,
+    setClientSentStatusRequest,
+    getClientSentStatusRequest,
 
     -- * digest accessors
     addHandshakeMessage,
@@ -134,6 +136,9 @@ data HandshakeState = HandshakeState
     , hstTLS13EarlySecret :: Maybe (BaseSecret EarlySecret) -- xxx
     , hstTLS13ResumptionSecret :: Maybe (BaseSecret ResumptionSecret)
     , hstCCS13Sent :: Bool
+    , hstCCS13Recv :: Bool
+    , hstClientSentStatusRequest :: Bool
+    -- ^ True if client sent status_request extension in ClientHello
     }
     deriving (Show)
 
@@ -225,6 +230,8 @@ newEmptyHandshake ver crand =
         , hstTLS13EarlySecret = Nothing
         , hstTLS13ResumptionSecret = Nothing
         , hstCCS13Sent = False
+        , hstCCS13Recv = False
+        , hstClientSentStatusRequest = False
         }
 
 runHandshake :: HandshakeState -> HandshakeM a -> (a, HandshakeState)
@@ -349,6 +356,12 @@ setClientCertChain b = modify (\hst -> hst{hstClientCertChain = Just b})
 
 getClientCertChain :: HandshakeM (Maybe CertificateChain)
 getClientCertChain = gets hstClientCertChain
+
+setClientSentStatusRequest :: Bool -> HandshakeM ()
+setClientSentStatusRequest b = modify (\hst -> hst{hstClientSentStatusRequest = b})
+
+getClientSentStatusRequest :: HandshakeM Bool
+getClientSentStatusRequest = gets hstClientSentStatusRequest
 
 --
 setCertReqToken :: Maybe ByteString -> HandshakeM ()

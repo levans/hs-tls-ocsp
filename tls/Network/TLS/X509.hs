@@ -33,9 +33,9 @@ import qualified Data.ByteString as B
 isNullCertificateChain :: CertificateChain -> Bool
 isNullCertificateChain (CertificateChain l) = null l
 
-getCertificateChainLeaf :: CertificateChain -> SignedExact Certificate
-getCertificateChainLeaf (CertificateChain []) = error "empty certificate chain"
-getCertificateChainLeaf (CertificateChain (x : _)) = x
+getCertificateChainLeaf :: CertificateChain -> Maybe (SignedExact Certificate)
+getCertificateChainLeaf (CertificateChain []) = Nothing
+getCertificateChainLeaf (CertificateChain (x : _)) = Just x
 
 -- | Certificate and Chain rejection reason
 data CertificateRejectReason
