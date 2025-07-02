@@ -259,7 +259,8 @@ sendServerHello13 sparams ctx clientKeyShare (usedCipher, usedHash, rtt0) CH{..}
         -- Also handle must-staple certificate validation
         ess <- if hasStatusRequest chExtensions && not (null cs)
             then do
-                mOcspResponse <- liftIO $ onCertificateStatus (serverHooks sparams)
+                clientSNI <- liftIO $ usingState_ ctx getClientSNI
+                mOcspResponse <- liftIO $ onCertificateStatus (serverHooks sparams) certChain clientSNI
                 case mOcspResponse of
                     Just ocspDer ->
                         -- Add OCSP extension to the leaf certificate only

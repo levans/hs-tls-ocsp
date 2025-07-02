@@ -135,7 +135,8 @@ sendServerFirstFlight ServerParams{..} ctx usedCipher mcred chExts = do
     -- Also handle must-staple certificate validation
     b3 <- if hasStatusRequest chExts
         then do
-            mOcspResponse <- onCertificateStatus serverHooks
+            clientSNI <- usingState_ ctx getClientSNI
+            mOcspResponse <- onCertificateStatus serverHooks cc clientSNI
             case mOcspResponse of
                 Just ocspDer -> return $ b2 . (CertificateStatus ocspDer :)
                 Nothing -> do

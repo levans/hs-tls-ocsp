@@ -649,13 +649,15 @@ data ServerHooks = ServerHooks
     --  of TLS 1.3.
     --
     -- Default: 'return'
-    , onCertificateStatus :: IO (Maybe ByteString)
+    , onCertificateStatus :: CertificateChain -> Maybe HostName -> IO (Maybe ByteString)
     -- ^ Called when the server needs to provide an OCSP response for certificate stapling.
+    -- The first parameter is the certificate chain being used for this connection.
+    -- The second parameter is the server name indication (SNI) from the client, if any.
     -- Return 'Nothing' to disable stapling, or 'Just' a DER-encoded OCSP response.
     -- This is called after certificate selection and should provide a response
     -- corresponding to the certificate being used.
     --
-    -- Default: 'Nothing' (no OCSP stapling)
+    -- Default: '\_ _ -> return Nothing' (no OCSP stapling)
     }
 
 -- | Default value for 'ServerHooks'
@@ -674,7 +676,7 @@ defaultServerHooks =
         , onNewHandshake = \_ -> return True
         , onALPNClientSuggest = Nothing
         , onEncryptedExtensionsCreating = return
-        , onCertificateStatus = return Nothing
+        , onCertificateStatus = \_ _ -> return Nothing
         }
 
 instance Show ServerHooks where
