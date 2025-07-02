@@ -83,6 +83,8 @@ module Network.TLS (
     OnServerCertificate,
     onServerCertificate,
     validateClientCertificate,
+    hasMustStapleExtension,
+    certificateChainRequiresStapling,
     onSuggestALPN,
     onCustomFFDHEGroup,
     onServerFinished,
@@ -97,6 +99,7 @@ module Network.TLS (
     onNewHandshake,
     onALPNClientSuggest,
     onEncryptedExtensionsCreating,
+    onCertificateStatus,
     Measurement,
     nbHandshakes,
     bytesReceived,
@@ -171,7 +174,7 @@ module Network.TLS (
 
     -- ** Validation Cache
     ValidationCache (..),
-    defaultValidationCache,
+    -- defaultValidationCache, -- Not available in this version
     ValidationCacheQueryCallback,
     ValidationCacheAddCallback,
     ValidationCacheResult (..),

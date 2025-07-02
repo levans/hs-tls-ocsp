@@ -1,8 +1,11 @@
-resolver: lts-22.39
+resolver: lts-23.25
 packages:
   - debug
   - tls
   - tls-session-manager
 extra-deps:
   - crypto-token-0.1.2
+  - auto-update-0.2.6@sha256:4adf0d523c8b8fbd53f32b79f115d5f304da7e1a2b35b66625497add8e9abbb5,1670
+  - crypton-x509-validation-1.6.14@sha256:0d9098835629777c42c414876c70f022f02e67223d7ad2ed8b8fcb1c863f79b4,2253
+  - zlib-0.7.1.0@sha256:85e64a75c0b490506a7edaa2d54950c668e66b65758bb08bb14cd31faf53a206,5357
 # flags: []

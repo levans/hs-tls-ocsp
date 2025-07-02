@@ -649,6 +649,13 @@ data ServerHooks = ServerHooks
     --  of TLS 1.3.
     --
     -- Default: 'return'
+    , onCertificateStatus :: IO (Maybe ByteString)
+    -- ^ Called when the server needs to provide an OCSP response for certificate stapling.
+    -- Return 'Nothing' to disable stapling, or 'Just' a DER-encoded OCSP response.
+    -- This is called after certificate selection and should provide a response
+    -- corresponding to the certificate being used.
+    --
+    -- Default: 'Nothing' (no OCSP stapling)
     }
 
 -- | Default value for 'ServerHooks'
@@ -667,6 +674,7 @@ defaultServerHooks =
         , onNewHandshake = \_ -> return True
         , onALPNClientSuggest = Nothing
         , onEncryptedExtensionsCreating = return
+        , onCertificateStatus = return Nothing
         }
 
 instance Show ServerHooks where

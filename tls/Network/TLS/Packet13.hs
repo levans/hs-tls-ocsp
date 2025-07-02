@@ -208,8 +208,8 @@ decodeCompressedCertificate13 = do
                     --                    _ -> fail "compressed certificate cannot be parsed"
                     _ -> fail $ "invalid compressed certificate: len = " ++ show len
 
-decompressIt :: ByteString -> Either DecompressError ByteString
+decompressIt :: ByteString -> Either String ByteString
 decompressIt inp = unsafePerformIO $ E.handle handler $ do
     Right . BL.toStrict <$> E.evaluate (decompress (BL.fromStrict inp))
   where
-    handler e = return $ Left (e :: DecompressError)
+    handler e = return $ Left (show (e :: E.SomeException))

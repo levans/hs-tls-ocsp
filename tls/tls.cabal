@@ -36,9 +36,13 @@ library
         Network.TLS.Extra.Cipher
         Network.TLS.Extra.FFDHE
         Network.TLS.QUIC
+        Network.TLS.Extension
+        Network.TLS.Struct
+        Network.TLS.Packet
+        Network.TLS.Wire
+        Network.TLS.X509
 
     other-modules:
-        Network.TLS.Struct
         Network.TLS.Struct13
         Network.TLS.Core
         Network.TLS.Context
@@ -51,7 +55,6 @@ library
         Network.TLS.Crypto.Types
         Network.TLS.ErrT
         Network.TLS.Error
-        Network.TLS.Extension
         Network.TLS.Handshake
         Network.TLS.Handshake.Certificate
         Network.TLS.Handshake.Client
@@ -87,7 +90,6 @@ library
         Network.TLS.KeySchedule
         Network.TLS.MAC
         Network.TLS.Measurement
-        Network.TLS.Packet
         Network.TLS.Packet13
         Network.TLS.Parameters
         Network.TLS.PostHandshake
@@ -110,9 +112,6 @@ library
         Network.TLS.Util
         Network.TLS.Util.ASN1
         Network.TLS.Util.Serialization
-        Network.TLS.Wire
-        Network.TLS.X509
-
     default-extensions: Strict StrictData
     default-language: Haskell2010
     ghc-options:      -Wall
@@ -148,6 +147,12 @@ test-suite spec
         CiphersSpec
         EncodeSpec
         HandshakeSpec
+        MustStapleSpec
+        OCSPExtensionSpec
+        OCSPHookSpec
+        CertificateStatusSpec
+        MustStapleAdvancedSpec
+        OCSPErrorSpec
         PipeChan
         PubKey
         Run
@@ -160,8 +165,10 @@ test-suite spec
     build-depends:
         base >=4.9 && <5,
         QuickCheck,
+        asn1-encoding,
         asn1-types,
         async,
+        binary,
         bytestring,
         crypton,
         crypton-x509,
