@@ -44,11 +44,12 @@ checkValidClientCertChain ctx errmsg = do
             | otherwise -> return cc
 
 credentialDigitalSignatureKey :: Credential -> Maybe PubKey
-credentialDigitalSignatureKey cred
-    | isDigitalSignaturePair keys = Just pubkey
-    | otherwise = Nothing
-  where
-    keys@(pubkey, _) = credentialPublicPrivateKeys cred
+credentialDigitalSignatureKey cred =
+    case credentialPublicPrivateKeys cred of
+        Nothing -> Nothing  -- empty certificate chain
+        Just keys@(pubkey, _)
+            | isDigitalSignaturePair keys -> Just pubkey
+            | otherwise -> Nothing
 
 filterCredentials :: (Credential -> Bool) -> Credentials -> Credentials
 filterCredentials p (Credentials l) = Credentials (filter p l)
@@ -69,9 +70,9 @@ makeCredentialPredicate ver exts
 
 isCredentialAllowed :: Version -> (Group -> Bool) -> Credential -> Bool
 isCredentialAllowed ver p cred =
-    pubkey `versionCompatible` ver && satisfiesEcPredicate p pubkey
-  where
-    (pubkey, _) = credentialPublicPrivateKeys cred
+    case credentialPublicPrivateKeys cred of
+        Nothing -> False  -- empty certificate chain not allowed
+        Just (pubkey, _) -> pubkey `versionCompatible` ver && satisfiesEcPredicate p pubkey
 
 -- Filters a list of candidate credentials with credentialMatchesHashSignatures.
 --
