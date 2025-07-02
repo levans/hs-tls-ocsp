@@ -28,14 +28,15 @@ import Data.X509.Validation
 import Data.ASN1.Types
 import Data.ASN1.Encoding
 import Data.ASN1.BinaryEncoding
+import Data.ASN1.OID
 import qualified Data.ByteString as B
 
 isNullCertificateChain :: CertificateChain -> Bool
 isNullCertificateChain (CertificateChain l) = null l
 
-getCertificateChainLeaf :: CertificateChain -> SignedExact Certificate
-getCertificateChainLeaf (CertificateChain []) = error "empty certificate chain"
-getCertificateChainLeaf (CertificateChain (x : _)) = x
+getCertificateChainLeaf :: CertificateChain -> Maybe (SignedExact Certificate)
+getCertificateChainLeaf (CertificateChain []) = Nothing
+getCertificateChainLeaf (CertificateChain (x : _)) = Just x
 
 -- | Certificate and Chain rejection reason
 data CertificateRejectReason
@@ -102,15 +103,13 @@ hasMustStapleExtension cert =
     getTLSFeatureExtensionBytes :: Extensions -> Maybe B.ByteString
     getTLSFeatureExtensionBytes (Extensions Nothing) = Nothing
     getTLSFeatureExtensionBytes (Extensions (Just extList)) = 
-        case findExtension extensionOID extList of
-            Just (ExtensionRaw _ critical bytes) -> Just bytes
-            Nothing -> Nothing
+        findExtensionByOID extensionOID extList
     
-    findExtension :: [Integer] -> [ExtensionRaw] -> Maybe ExtensionRaw
-    findExtension targetOID [] = Nothing
-    findExtension targetOID (ext@(ExtensionRaw oid _ _) : rest)
-        | oid == targetOID = Just ext
-        | otherwise = findExtension targetOID rest
+    findExtensionByOID :: [Integer] -> [ExtensionRaw] -> Maybe B.ByteString
+    findExtensionByOID targetOID [] = Nothing
+    findExtensionByOID targetOID (ExtensionRaw oid _ bytes : rest)
+        | oid == targetOID = Just bytes
+        | otherwise = findExtensionByOID targetOID rest
 
 -- | Parse TLS Feature extension content to check for must-staple (value 5)
 parseTLSFeatureExtension :: B.ByteString -> Bool
@@ -121,14 +120,15 @@ parseTLSFeatureExtension bytes =
 
 -- | Check if ASN.1 sequence contains status_request feature (value 5)
 hasStatusRequestFeature :: [ASN1] -> Bool
-hasStatusRequestFeature asn1 = 5 `elem` extractIntegers asn1
+hasStatusRequestFeature asn1 = 5 `elem` extractIntegers 10 asn1  -- Max depth of 10
   where
-    extractIntegers :: [ASN1] -> [Integer]
-    extractIntegers [] = []
-    extractIntegers (Start Sequence : rest) = extractIntegers rest
-    extractIntegers (End Sequence : rest) = extractIntegers rest
-    extractIntegers (IntVal n : rest) = n : extractIntegers rest
-    extractIntegers (_ : rest) = extractIntegers rest
+    extractIntegers :: Int -> [ASN1] -> [Integer]
+    extractIntegers 0 _ = []  -- Prevent deep recursion
+    extractIntegers _ [] = []
+    extractIntegers depth (Start Sequence : rest) = extractIntegers (depth - 1) rest
+    extractIntegers depth (End Sequence : rest) = extractIntegers depth rest
+    extractIntegers depth (IntVal n : rest) = n : extractIntegers depth rest
+    extractIntegers depth (_ : rest) = extractIntegers depth rest
 
 -- | Check if any certificate in the chain requires OCSP stapling
 -- According to RFC 7633, only the leaf certificate's must-staple matters

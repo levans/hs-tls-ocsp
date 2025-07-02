@@ -183,6 +183,8 @@ pattern EID_CompressCertificate                 :: ExtensionID -- RFC8879
 pattern EID_CompressCertificate                  = ExtensionID 0x1b
 pattern EID_RecordSizeLimit                     :: ExtensionID -- RFC8449
 pattern EID_RecordSizeLimit                      = ExtensionID 0x1c
+pattern EID_TLSFeature                          :: ExtensionID -- RFC7633  
+pattern EID_TLSFeature                           = ExtensionID 0x18
 pattern EID_SessionTicket                       :: ExtensionID -- RFC4507
 pattern EID_SessionTicket                        = ExtensionID 0x23
 pattern EID_PreSharedKey                        :: ExtensionID -- RFC8446
@@ -237,6 +239,7 @@ instance Show ExtensionID where
     show EID_ExtendedMainSecret      = "ExtendedMainSecret"
     show EID_CompressCertificate     = "CompressCertificate"
     show EID_RecordSizeLimit         = "RecordSizeLimit"
+    show EID_TLSFeature              = "TLSFeature"
     show EID_SessionTicket           = "SessionTicket"
     show EID_PreSharedKey            = "PreSharedKey"
     show EID_EarlyData               = "EarlyData"
@@ -451,7 +454,7 @@ instance Extension ServerName where
     extensionDecode MsgTClientHello = decodeServerName
     extensionDecode MsgTServerHello = decodeServerName
     extensionDecode MsgTEncryptedExtensions = decodeServerName
-    extensionDecode _ = error "extensionDecode: ServerName"
+    extensionDecode _ = const Nothing
 
 decodeServerName :: ByteString -> Maybe ServerName
 decodeServerName "" = Just $ ServerName [] -- dirty hack for servers
@@ -503,7 +506,7 @@ instance Extension MaxFragmentLength where
     extensionDecode MsgTClientHello = decodeMaxFragmentLength
     extensionDecode MsgTServerHello = decodeMaxFragmentLength
     extensionDecode MsgTEncryptedExtensions = decodeMaxFragmentLength
-    extensionDecode _ = error "extensionDecode: MaxFragmentLength"
+    extensionDecode _ = const Nothing
 
 decodeMaxFragmentLength :: ByteString -> Maybe MaxFragmentLength
 decodeMaxFragmentLength = runGetMaybe $ toMaxFragmentEnum <$> getWord8
@@ -672,7 +675,7 @@ instance Extension StatusRequest where
         putWord16 0     -- request_extensions length (empty)
     extensionDecode MsgTClientHello = decodeStatusRequest
     extensionDecode MsgTServerHello = decodeStatusRequest
-    extensionDecode _ = error "extensionDecode: StatusRequest"
+    extensionDecode _ = const Nothing
 
 decodeStatusRequest :: ByteString -> Maybe StatusRequest
 decodeStatusRequest = runGetMaybe $ do

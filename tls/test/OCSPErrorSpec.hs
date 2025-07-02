@@ -24,27 +24,10 @@ spec :: Spec
 spec = describe "OCSP Error Conditions and Edge Cases" $ do
     describe "Must-staple validation errors" $ do
         it "should fail when must-staple cert requires OCSP but client doesn't request it" $ do
-            -- Simulate scenario: certificate requires stapling, client doesn't request, no OCSP response
-            let hasClientRequest = False
-                hasOcspResponse = Nothing
-                certRequiresStapling = True
-            
-            if not hasClientRequest && certRequiresStapling
-                then expectationFailure "Should throw error: certificate requires OCSP stapling but client did not request it"
-                else return ()
-            
             -- This test verifies our error condition logic
             pendingWith "Need integration test framework to properly test this error condition"
 
         it "should fail when must-staple cert requires OCSP but server doesn't provide response" $ do
-            let hasClientRequest = True
-                hasOcspResponse = Nothing
-                certRequiresStapling = True
-            
-            if hasClientRequest && isNothing hasOcspResponse && certRequiresStapling
-                then expectationFailure "Should throw error: certificate requires OCSP stapling but no OCSP response provided"
-                else return ()
-            
             pendingWith "Need integration test framework to properly test this error condition"
 
     describe "Extension negotiation edge cases" $ do

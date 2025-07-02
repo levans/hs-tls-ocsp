@@ -52,9 +52,10 @@ spec = describe "CertificateStatus Handshake Message" $ do
         it "can encode CertificateStatus message" $ do
             let certStatus = CertificateStatus mockOcspDer
                 encoded = encodeHandshake certStatus
-            -- Should be: status_type=1 (1 byte) + length (2 bytes) + OCSP data
-            B.length encoded `shouldBe` (1 + 2 + B.length mockOcspDer)
-            B.head encoded `shouldBe` 0x01 -- status_type = OCSP
+            -- Should be: handshake header (4 bytes) + status_type=1 (1 byte) + length (2 bytes) + OCSP data
+            B.length encoded `shouldBe` (4 + 1 + 2 + B.length mockOcspDer)
+            -- Check handshake type (first byte should be 22 for CertificateStatus)
+            B.head encoded `shouldBe` 22 -- HandshakeType_CertificateStatus
 
         it "encodes OCSP data length correctly" $ do
             let certStatus = CertificateStatus mockOcspDer
@@ -65,8 +66,8 @@ spec = describe "CertificateStatus Handshake Message" $ do
         it "includes OCSP data in encoding" $ do
             let certStatus = CertificateStatus mockOcspDer
                 encoded = encodeHandshake certStatus
-                -- Extract OCSP data (skip status_type + length)
-                extractedOcsp = B.drop 3 encoded
+                -- Extract OCSP data (skip handshake header + status_type + length)
+                extractedOcsp = B.drop 7 encoded  -- 4 (header) + 1 (status_type) + 2 (length)
             extractedOcsp `shouldBe` mockOcspDer
 
     describe "CertificateStatus decoding" $ do

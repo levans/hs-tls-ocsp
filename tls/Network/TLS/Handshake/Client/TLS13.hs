@@ -221,7 +221,9 @@ processCertAndVerify
 processCertAndVerify cparams ctx cc = do
     liftIO $ usingState_ ctx $ setServerCertificateChain cc
     liftIO $ doCertificate cparams ctx cc
-    let pubkey = certPubKey $ getCertificate $ getCertificateChainLeaf cc
+    pubkey <- case getCertificateChainLeaf cc of
+        Just leafCert -> return $ certPubKey $ getCertificate leafCert
+        Nothing -> throwCore $ Error_Protocol "empty certificate chain" CertificateUnknown
     ver <- liftIO $ usingState_ ctx getVersion
     checkDigitalSignatureKey ver pubkey
     usingHState ctx $ setPublicKey pubkey
