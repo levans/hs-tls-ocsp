@@ -125,6 +125,24 @@ sendServerFirstFlight sparams ctx usedCipher mcred chExts = do
             Nothing -> b1
             Just kx -> b1 . (ServerKeyXchg kx :)
 
+    -- Send OCSP CertificateStatus if client requested it and server provides response
+    -- Also handle must-staple certificate validation
+    b3 <- if hasStatusRequest chExts
+        then do
+            clientSNI <- usingState_ ctx getClientSNI
+            mOcspResponse <- onCertificateStatus (serverHooks sparams) cc clientSNI
+            case mOcspResponse of
+                Just ocspDer -> return $ b2 . (CertificateStatus ocspDer :)
+                Nothing -> do
+                    -- Check if certificate requires OCSP stapling (must-staple)
+                    if certificateChainRequiresStapling cc
+                        then throwCore $ Error_Protocol "certificate requires OCSP stapling but no OCSP response provided" CertificateRequired
+                        else return b2
+        else do
+            -- Client didn't request OCSP but check if certificate requires it (must-staple)
+            if certificateChainRequiresStapling cc
+                then throwCore $ Error_Protocol "certificate requires OCSP stapling but client did not request it" CertificateRequired
+                else return b2
     -- FIXME we don't do this on a Anonymous server
 
     -- When configured, send a certificate request with the DNs of all
@@ -143,8 +161,8 @@ sendServerFirstFlight sparams ctx usedCipher mcred chExts = do
                         hashSigs
                         (map extractCAname $ serverCACertificates sparams)
             usingHState ctx $ setCertReqSent True
-            return $ b2 . (creq :)
-        else return b2
+            return $ b3 . (creq :)
+        else return b3
   where
     setup_DHE = do
         let possibleFFGroups = negotiatedGroupsInCommon ctx chExts `intersect` availableFFGroups
