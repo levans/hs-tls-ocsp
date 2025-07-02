@@ -141,13 +141,13 @@ credentialCanSign (chain, priv) =
             cert = getCertificate signed
             pub = certPubKey cert
 
-credentialPublicPrivateKeys :: Credential -> (PubKey, PrivKey)
+credentialPublicPrivateKeys :: Credential -> Maybe (PubKey, PrivKey)
 credentialPublicPrivateKeys (chain, priv) = 
     case getCertificateChainLeaf chain of
         Just signed -> let cert = getCertificate signed
                            pub = certPubKey cert
-                       in pub `seq` (pub, priv)
-        Nothing -> error "credentialPublicPrivateKeys: empty certificate chain"
+                       in Just (pub `seq` (pub, priv))
+        Nothing -> Nothing  -- empty certificate chain
 
 getHashSignature :: SignedCertificate -> Maybe TLS.HashAndSignatureAlgorithm
 getHashSignature signed =
