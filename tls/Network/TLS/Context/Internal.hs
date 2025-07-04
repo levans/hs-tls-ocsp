@@ -448,3 +448,61 @@ getCertRequest13 ctx context = do
   where
     fromCertRequest13 (CertRequest13 c _) = c
     fromCertRequest13 _ = error "fromCertRequest13"
+
+--------------------------------
+
+setMyRecordLimit :: Context -> Maybe Int -> IO ()
+setMyRecordLimit ctx msiz = modifyIORef (ctxMyRecordLimit ctx) change
+  where
+    change (RecordLimit n _) = RecordLimit n msiz
+    change x = x
+
+enableMyRecordLimit :: Context -> IO ()
+enableMyRecordLimit ctx = modifyIORef (ctxMyRecordLimit ctx) change
+  where
+    change (RecordLimit _ (Just n)) = RecordLimit n Nothing
+    change x = x
+
+getMyRecordLimit :: Context -> IO (Maybe Int)
+getMyRecordLimit ctx = change <$> readIORef (ctxMyRecordLimit ctx)
+  where
+    change NoRecordLimit = Nothing
+    change (RecordLimit n _) = Just n
+
+checkMyRecordLimit :: Context -> IO Bool
+checkMyRecordLimit ctx = chk <$> readIORef (ctxMyRecordLimit ctx)
+  where
+    chk NoRecordLimit = False
+    chk (RecordLimit _ mx) = isJust mx
+
+--------------------------------
+
+setPeerRecordLimit :: Context -> Maybe Int -> IO ()
+setPeerRecordLimit ctx msiz = modifyIORef (ctxPeerRecordLimit ctx) change
+  where
+    change (RecordLimit n _) = RecordLimit n msiz
+    change x = x
+
+enablePeerRecordLimit :: Context -> IO ()
+enablePeerRecordLimit ctx = modifyIORef (ctxPeerRecordLimit ctx) change
+  where
+    change (RecordLimit _ (Just n))
+        | n <= 0 = error $ "enablePeerRecordLimit: invalid record limit " ++ show n
+        | otherwise = RecordLimit n Nothing
+    change x = x
+
+getPeerRecordLimit :: Context -> IO (Maybe Int)
+getPeerRecordLimit ctx = change <$> readIORef (ctxPeerRecordLimit ctx)
+  where
+    change NoRecordLimit = Nothing
+    change (RecordLimit n _) = Just n
+
+checkPeerRecordLimit :: Context -> IO Bool
+checkPeerRecordLimit ctx = chk <$> readIORef (ctxPeerRecordLimit ctx)
+  where
+    chk NoRecordLimit = False
+    chk (RecordLimit _ mx) = isJust mx
+
+newRecordLimitRef :: Maybe Int -> IO (IORef RecordLimit)
+newRecordLimitRef Nothing = newIORef NoRecordLimit
+newRecordLimitRef (Just n) = newIORef $ RecordLimit n Nothing

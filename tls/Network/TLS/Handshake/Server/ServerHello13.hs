@@ -250,12 +250,12 @@ sendServerHello13 sparams ctx clientKeyShare (usedCipher, usedHash, rtt0) CH{..}
                          in return $ [ocspExt] : replicate (length cs - 1) []
                     Nothing -> do
                         -- Check if certificate requires OCSP stapling (must-staple)
-                        if certificateChainRequiresStapling certChain
+                        if certificateChainRequiresStapling certChain && serverEnforceMustStaple sparams
                             then liftIO $ throwCore $ Error_Protocol "certificate requires OCSP stapling but no OCSP response provided" CertificateRequired
                             else return $ replicate (length cs) []
             else do
                 -- Client didn't request OCSP but check if certificate requires it (must-staple)
-                if not (null cs) && certificateChainRequiresStapling certChain
+                if not (null cs) && certificateChainRequiresStapling certChain && serverEnforceMustStaple sparams
                     then liftIO $ throwCore $ Error_Protocol "certificate requires OCSP stapling but client did not request it" CertificateRequired
                     else return $ replicate (length cs) []
         loadPacket13 ctx $ Handshake13 [Certificate13 "" certChain ess]

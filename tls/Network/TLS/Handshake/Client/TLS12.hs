@@ -65,13 +65,13 @@ expectCertificateStatus cparams ctx (CertificateStatus ocspDer) = do
             case result of
                 CertificateUsageAccept -> return $ RecvStateHandshake (expectServerKeyExchange ctx)
                 CertificateUsageReject reason -> throwCore $ Error_Certificate (show reason)
-expectCertificateStatus _ ctx p = do
+expectCertificateStatus cparams ctx p = do
     -- No CertificateStatus received - check if certificate requires stapling
     mCerts <- usingState_ ctx getServerCertificateChain
     case mCerts of
         Nothing -> expectServerKeyExchange ctx p  -- No certs to check
         Just certs -> 
-            if certificateChainRequiresStapling certs
+            if certificateChainRequiresStapling certs && clientEnforceMustStaple cparams
                 then throwCore $ Error_Protocol "certificate requires OCSP stapling but no response received" CertificateRequired
                 else expectServerKeyExchange ctx p
 

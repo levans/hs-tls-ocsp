@@ -133,6 +133,12 @@ data ClientParams = ClientParams
     -- is automatically re-sent.
     --
     -- Default: 'False'
+    , clientEnforceMustStaple :: Bool
+    -- ^ Whether to enforce must-staple certificate requirement strictly.
+    -- If True, connections fail when must-staple certificates can't provide OCSP stapling.
+    -- If False, connections continue with a warning.
+    --
+    -- Default: True (RFC 7633 compliant)
     }
     deriving (Show)
 
@@ -149,6 +155,7 @@ defaultParamsClient serverName serverId =
         , clientSupported = def
         , clientDebug = defaultDebugParams
         , clientUseEarlyData = False
+        , clientEnforceMustStaple = True
         }
 
 data ServerParams = ServerParams
@@ -190,6 +197,20 @@ data ServerParams = ServerParams
     -- Acceptable value range is 0 to 604800 (7 days).
     --
     -- Default: 7200 (2 hours)
+    , serverLimit :: Limit
+    
+    -- | OCSP timeout in microseconds for HTTP/2 connections.
+    -- If OCSP hook takes longer than this, connection continues without OCSP stapling.
+    --
+    -- Default: 2000000 (2 seconds)
+    , serverOCSPTimeoutMicros :: Int
+    
+    -- | Whether to enforce must-staple certificate requirement strictly.
+    -- If True, connections fail when must-staple certificates can't provide OCSP stapling.
+    -- If False, connections continue with a warning.
+    --
+    -- Default: True (RFC 7633 compliant)
+    , serverEnforceMustStaple :: Bool
     }
     deriving (Show)
 
@@ -205,6 +226,9 @@ defaultParamsServer =
         , serverDebug = defaultDebugParams
         , serverEarlyDataSize = 0
         , serverTicketLifetime = 7200
+        , serverLimit = defaultLimit
+        , serverOCSPTimeoutMicros = 2000000  -- 2 seconds
+        , serverEnforceMustStaple = True     -- RFC 7633 compliant
         }
 
 instance Default ServerParams where

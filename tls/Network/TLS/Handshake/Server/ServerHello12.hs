@@ -27,6 +27,8 @@ import Network.TLS.Struct
 import Network.TLS.Types
 import Network.TLS.X509 hiding (Certificate)
 
+import System.Timeout (timeout)
+
 sendServerHello12
     :: ServerParams
     -> Context
@@ -113,7 +115,43 @@ sendServerFirstFlight sparams ctx usedCipher mcred chExts = do
     let b1 = b0 . (Certificate cc :)
     usingState_ ctx $ setServerCertificateChain cc
 
-    -- send server key exchange if needed
+    -- Send OCSP CertificateStatus immediately after Certificate (RFC 6066)
+    -- Also handle must-staple certificate validation
+    b2 <- if hasStatusRequest chExts && not (isNullCertificateChain cc)
+        then do
+            clientSNI <- usingState_ ctx getClientSNI
+            
+            -- Check if HTTP/2 was negotiated via ALPN - if so, use non-blocking OCSP
+            alpnProto <- usingState_ ctx getNegotiatedProtocol
+            let isHTTP2 = alpnProto == Just "h2"
+            
+            mOcspResponse <- if isHTTP2
+                then do
+                    -- For HTTP/2, call OCSP hook with configurable timeout to prevent handshake hanging
+                    result <- timeout serverOCSPTimeoutMicros $ onCertificateStatus serverHooks cc clientSNI
+                    case result of
+                        Just ocspResp -> return ocspResp
+                        Nothing -> return Nothing  -- Timeout - don't provide OCSP response
+                else 
+                    -- For HTTP/1.1, use normal blocking call
+                    onCertificateStatus serverHooks cc clientSNI
+                    
+            case mOcspResponse of
+                Just ocspDer -> return $ b1 . (CertificateStatus ocspDer :)
+                Nothing -> do
+                    -- Check if certificate requires OCSP stapling (must-staple)
+                    if certificateChainRequiresStapling cc && serverEnforceMustStaple
+                        then if isHTTP2
+                            then throwCore $ Error_Protocol "certificate requires OCSP stapling but OCSP hook timed out (HTTP/2)" CertificateRequired
+                            else throwCore $ Error_Protocol "certificate requires OCSP stapling but no OCSP response provided" CertificateRequired
+                        else return b1
+        else do
+            -- Client didn't request OCSP but check if certificate requires it (must-staple)
+            if not (isNullCertificateChain cc) && certificateChainRequiresStapling cc && serverEnforceMustStaple
+                then throwCore $ Error_Protocol "certificate requires OCSP stapling but client did not request it" CertificateRequired
+                else return b1
+
+    -- send server key exchange if needed (after Certificate and CertificateStatus)
     skx <- case cipherKeyExchange usedCipher of
         CipherKeyExchange_DH_Anon -> Just <$> generateSKX_DH_Anon
         CipherKeyExchange_DHE_RSA -> Just <$> generateSKX_DHE KX_RSA
@@ -121,28 +159,9 @@ sendServerFirstFlight sparams ctx usedCipher mcred chExts = do
         CipherKeyExchange_ECDHE_RSA -> Just <$> generateSKX_ECDHE KX_RSA
         CipherKeyExchange_ECDHE_ECDSA -> Just <$> generateSKX_ECDHE KX_ECDSA
         _ -> return Nothing
-    let b2 = case skx of
-            Nothing -> b1
-            Just kx -> b1 . (ServerKeyXchg kx :)
-
-    -- Send OCSP CertificateStatus if client requested it and server provides response
-    -- Also handle must-staple certificate validation
-    b3 <- if hasStatusRequest chExts
-        then do
-            clientSNI <- usingState_ ctx getClientSNI
-            mOcspResponse <- onCertificateStatus (serverHooks sparams) cc clientSNI
-            case mOcspResponse of
-                Just ocspDer -> return $ b2 . (CertificateStatus ocspDer :)
-                Nothing -> do
-                    -- Check if certificate requires OCSP stapling (must-staple)
-                    if certificateChainRequiresStapling cc
-                        then throwCore $ Error_Protocol "certificate requires OCSP stapling but no OCSP response provided" CertificateRequired
-                        else return b2
-        else do
-            -- Client didn't request OCSP but check if certificate requires it (must-staple)
-            if certificateChainRequiresStapling cc
-                then throwCore $ Error_Protocol "certificate requires OCSP stapling but client did not request it" CertificateRequired
-                else return b2
+    let b3 = case skx of
+            Nothing -> b2
+            Just kx -> b2 . (ServerKeyXchg kx :)
     -- FIXME we don't do this on a Anonymous server
 
     -- When configured, send a certificate request with the DNs of all
