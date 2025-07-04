@@ -507,7 +507,9 @@ setPeerRecordLimit ctx msiz = modifyIORef (ctxPeerRecordLimit ctx) change
 enablePeerRecordLimit :: Context -> IO ()
 enablePeerRecordLimit ctx = modifyIORef (ctxPeerRecordLimit ctx) change
   where
-    change (RecordLimit _ (Just n)) = RecordLimit n Nothing
+    change (RecordLimit _ (Just n))
+        | n <= 0 = error $ "enablePeerRecordLimit: invalid record limit " ++ show n
+        | otherwise = RecordLimit n Nothing
     change x = x
 
 getPeerRecordLimit :: Context -> IO (Maybe Int)

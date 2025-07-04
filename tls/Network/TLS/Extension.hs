@@ -680,13 +680,13 @@ instance Extension StatusRequest where
 decodeStatusRequest :: ByteString -> Maybe StatusRequest
 decodeStatusRequest = runGetMaybe $ do
     statusType <- getWord8
-    when (statusType /= 1) $ fail "unsupported status type"
+    when (statusType /= 1) $ fail "StatusRequest: unsupported status type (only OCSP supported)"
     responderIdLen <- getWord16
-    _ <- getBytes (fromIntegral responderIdLen)  -- skip responder ID list
+    _ <- getBytes (fromIntegral responderIdLen)  -- skip responder ID list  
     requestExtLen <- getWord16
     _ <- getBytes (fromIntegral requestExtLen)   -- skip request extensions
     leftoverLen <- remaining
-    when (leftoverLen /= 0) $ fail "decodeStatusRequest: broken length"
+    when (leftoverLen /= 0) $ fail "StatusRequest: invalid extension length"
     return StatusRequest
 
 ------------------------------------------------------------
