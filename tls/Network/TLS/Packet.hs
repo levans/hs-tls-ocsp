@@ -316,7 +316,7 @@ decodeCertificateStatus :: Get Handshake
 decodeCertificateStatus = do
     statusType <- getWord8
     when (statusType /= 1) $ fail "unknown certificate status type"
-    CertificateStatus <$> getOpaque16
+    CertificateStatus <$> getOpaque24
 
 ----------------------------------------------------------------
 -- encode HANDSHAKE
@@ -381,7 +381,7 @@ encodeHandshake' (ClientKeyXchg ckx) = runPut $ do
 encodeHandshake' (Finished (VerifyData opaque)) = runPut $ putBytes opaque
 encodeHandshake' (CertificateStatus der) = runPut $ do
     putWord8 0x01  -- status_type = ocsp
-    putOpaque16 der
+    putOpaque24 der
 
 ------------------------------------------------------------
 -- CA distinguished names

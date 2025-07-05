@@ -2,7 +2,6 @@ packages:
   tls
   tls-session-manager
   debug
-  test-scripts
 
 test-show-details: direct
 

@@ -326,10 +326,16 @@ makeServerHello sparams ctx usedCipher mcred chExts session = do
 
     recodeSizeLimitExt <- processRecordSizeLimit ctx chExts False
 
+    let statusReqExt =
+            if hasStatusRequest chExts
+                then Just $ ExtensionRaw EID_StatusRequest ""   -- empty payload as per RFC 6066
+                else Nothing
+
     let shExts =
             sharedHelloExtensions (serverShared sparams)
                 ++ catMaybes
                     [ {- 0x00 -} sniExt
+                    , {- 0x05 -} statusReqExt
                     , {- 0x0b -} ecPointExt
                     , {- 0x10 -} alpnExt
                     , {- 0x17 -} emsExt
