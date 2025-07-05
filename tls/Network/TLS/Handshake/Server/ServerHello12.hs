@@ -307,18 +307,42 @@ makeServerHello sparams ctx usedCipher mcred chExts session = do
                     Just _ -> return [ExtensionRaw EID_ServerName ""]
                     Nothing -> return []
     let useTicket = sessionUseTicket $ sharedSessionManager $ serverShared sparams
-        ticktExt
-            | not resuming && useTicket =
-                let raw = extensionEncode $ SessionTicket ""
-                 in [ExtensionRaw EID_SessionTicket raw]
-            | otherwise = []
+        sessionTicketExt
+            | not resuming && useTicket = Just $ toExtensionRaw $ SessionTicket ""
+            | otherwise = Nothing
+
+    -- in TLS12, we need to check as well the certificates we are sending if they have in the extension
+    -- the necessary bits set.
+    secReneg <- usingState_ ctx getSecureRenegotiation
+    secureRenegExt <-
+        if secReneg
+            then do
+                vd <- usingState_ ctx $ do
+                    VerifyData cvd <- getVerifyData ClientRole
+                    VerifyData svd <- getVerifyData ServerRole
+                    return $ SecureRenegotiation cvd svd
+                return $ Just $ toExtensionRaw vd
+            else return Nothing
+
+    recodeSizeLimitExt <- processRecordSizeLimit ctx chExts False
+
+    let statusReqExt =
+            if hasStatusRequest chExts
+                then Just $ ExtensionRaw EID_StatusRequest ""   -- empty payload as per RFC 6066
+                else Nothing
+
     let shExts =
             sharedHelloExtensions (serverShared sparams)
-                ++ secRengExt
-                ++ emsExt
-                ++ protoExt
-                ++ sniExt
-                ++ ticktExt
+                ++ catMaybes
+                    [ {- 0x00 -} sniExt
+                    , {- 0x05 -} statusReqExt
+                    , {- 0x0b -} ecPointExt
+                    , {- 0x10 -} alpnExt
+                    , {- 0x17 -} emsExt
+                    , {- 0x1c -} recodeSizeLimitExt
+                    , {- 0x23 -} sessionTicketExt
+                    , {- 0xff01 -} secureRenegExt
+                    ]
     usingState_ ctx $ setVersion TLS12
     usingHState ctx $
         setServerHelloParameters TLS12 srand usedCipher nullCompression

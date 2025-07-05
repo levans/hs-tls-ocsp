@@ -7,6 +7,7 @@ module Network.TLS.Handshake.Server.ServerHello13 (
 
 import Control.Monad.State.Strict
 import qualified Data.ByteString as B
+import Data.Serialize (runPut, putWord8)
 
 import Network.TLS.Cipher
 import Network.TLS.Context.Internal
@@ -30,7 +31,15 @@ import Network.TLS.State
 import Network.TLS.Struct
 import Network.TLS.Struct13
 import Network.TLS.Types
+import Network.TLS.Wire (putOpaque24)
 import Network.TLS.X509
+
+-- | Encode OCSP response in CertificateStatus format for TLS 1.3 extensions
+-- In TLS 1.3, OCSP responses in Certificate extensions must use the same format as TLS 1.2 CertificateStatus
+encodeCertificateStatusForExtension :: B.ByteString -> B.ByteString
+encodeCertificateStatusForExtension ocspDer = runPut $ do
+    putWord8 0x01      -- status_type = 1 (OCSP)
+    putOpaque24 ocspDer -- length (3 bytes) + OCSP DER data
 
 sendServerHello13
     :: ServerParams
@@ -246,7 +255,9 @@ sendServerHello13 sparams ctx clientKeyShare (usedCipher, usedHash, rtt0) CH{..}
                 case mOcspResponse of
                     Just ocspDer ->
                         -- Add OCSP extension to the leaf certificate only
-                        let ocspExt = ExtensionRaw EID_StatusRequest ocspDer
+                        -- For TLS 1.3, we need to wrap the OCSP DER in CertificateStatus format
+                        let wrappedOcsp = encodeCertificateStatusForExtension ocspDer
+                            ocspExt = ExtensionRaw EID_StatusRequest wrappedOcsp
                          in return $ [ocspExt] : replicate (length cs - 1) []
                     Nothing -> do
                         -- Check if certificate requires OCSP stapling (must-staple)

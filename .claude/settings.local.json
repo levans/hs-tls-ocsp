@@ -26,7 +26,8 @@
       "Bash(sed:*)",
       "Bash(stack test:*)",
       "Bash(find:*)",
-      "Bash(runhaskell:*)"
+      "Bash(runhaskell:*)",
+      "Bash(git rm:*)"
     ],
     "deny": []
   }
