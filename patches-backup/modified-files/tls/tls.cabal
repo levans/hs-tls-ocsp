@@ -1,6 +1,6 @@
 cabal-version:      >=1.10
 name:               tls
-version:            2.1.1
+version:            2.1.8
 license:            BSD3
 license-file:       LICENSE
 copyright:          Vincent Hanquez <vincent@snarc.org>
@@ -37,10 +37,12 @@ library
         Network.TLS.Extra.FFDHE
         Network.TLS.QUIC
         Network.TLS.Extension
+        Network.TLS.Struct
+        Network.TLS.Packet
+        Network.TLS.Wire
         Network.TLS.X509
 
     other-modules:
-        Network.TLS.Struct
         Network.TLS.Struct13
         Network.TLS.Core
         Network.TLS.Context
@@ -52,6 +54,7 @@ library
         Network.TLS.Crypto.IES
         Network.TLS.Crypto.Types
         Network.TLS.ErrT
+        Network.TLS.Error
         Network.TLS.Handshake
         Network.TLS.Handshake.Certificate
         Network.TLS.Handshake.Client
@@ -78,35 +81,37 @@ library
         Network.TLS.Handshake.Signature
         Network.TLS.Handshake.State
         Network.TLS.Handshake.State13
+        Network.TLS.HashAndSignature
         Network.TLS.Hooks
         Network.TLS.IO
+        Network.TLS.IO.Decode
+        Network.TLS.IO.Encode
         Network.TLS.Imports
         Network.TLS.KeySchedule
         Network.TLS.MAC
         Network.TLS.Measurement
-        Network.TLS.Packet
         Network.TLS.Packet13
         Network.TLS.Parameters
         Network.TLS.PostHandshake
+        Network.TLS.RNG
         Network.TLS.Record
-        Network.TLS.Record.Disengage
-        Network.TLS.Record.Engage
+        Network.TLS.Record.Decrypt
+        Network.TLS.Record.Encrypt
         Network.TLS.Record.Layer
-        Network.TLS.Record.Reading
-        Network.TLS.Record.Writing
+        Network.TLS.Record.Recv
+        Network.TLS.Record.Send
         Network.TLS.Record.State
         Network.TLS.Record.Types
-        Network.TLS.RNG
-        Network.TLS.State
         Network.TLS.Session
-        Network.TLS.Sending
-        Network.TLS.Receiving
+        Network.TLS.State
+        Network.TLS.Types
+        Network.TLS.Types.Cipher
+        Network.TLS.Types.Secret
+        Network.TLS.Types.Session
+        Network.TLS.Types.Version
         Network.TLS.Util
         Network.TLS.Util.ASN1
         Network.TLS.Util.Serialization
-        Network.TLS.Types
-        Network.TLS.Wire
-
     default-extensions: Strict StrictData
     default-language: Haskell2010
     ghc-options:      -Wall
@@ -114,21 +119,21 @@ library
         base >=4.9 && <5,
         asn1-encoding >= 0.9 && < 0.10,
         asn1-types >= 0.3 && < 0.4,
-        async >= 2.2 && < 2.3,
         base16-bytestring,
         bytestring >= 0.10 && < 0.13,
         cereal >= 0.5.3 && < 0.6,
         crypton >= 0.34,
         crypton-x509 >= 1.7 && < 1.8,
         crypton-x509-store >= 1.6 && < 1.7,
-        crypton-x509-validation >= 1.6.5 && < 1.7,
-        data-default-class >= 0.1 && < 0.2,
+        crypton-x509-validation >= 1.6.13 && < 1.7,
+        data-default,
         memory >= 0.18 && < 0.19,
         mtl >= 2.2 && < 2.4,
         network >= 3.1,
         serialise >= 0.2 && < 0.3,
         transformers >= 0.5 && < 0.7,
-        unix-time >= 0.4.11 && < 0.5
+        unix-time >= 0.4.11 && < 0.5,
+        zlib >= 0.7 && < 0.8
 
 test-suite spec
     type:               exitcode-stdio-1.0
@@ -144,6 +149,10 @@ test-suite spec
         HandshakeSpec
         MustStapleSpec
         OCSPExtensionSpec
+        OCSPHookSpec
+        CertificateStatusSpec
+        MustStapleAdvancedSpec
+        OCSPErrorSpec
         PipeChan
         PubKey
         Run
@@ -156,13 +165,14 @@ test-suite spec
     build-depends:
         base >=4.9 && <5,
         QuickCheck,
+        asn1-encoding,
         asn1-types,
         async,
+        binary,
         bytestring,
         crypton,
         crypton-x509,
         crypton-x509-validation,
-        data-default-class,
         hourglass,
         hspec,
         serialise,
@@ -187,7 +197,6 @@ executable tls-server
         crypton,
         crypton-x509-store,
         crypton-x509-system,
-        data-default-class,
         network,
         network-run,
         tls
@@ -215,7 +224,6 @@ executable tls-client
         crypton,
         crypton-x509-store,
         crypton-x509-system,
-        data-default-class,
         network,
         network-run,
         tls

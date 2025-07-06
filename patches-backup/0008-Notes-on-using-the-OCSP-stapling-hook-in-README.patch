@@ -1,0 +1,108 @@
+From 8cf41a0feda430fc2e4f7ea5fe9eeab87ccbeb3c Mon Sep 17 00:00:00 2001
+From: Luke Evans <luke.evans@gmail.com>
+Date: Sat, 5 Jul 2025 09:41:40 -0700
+Subject: [PATCH 8/9] Notes on using the OCSP stapling hook in README
+
+---
+ README.md | 88 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 88 insertions(+)
+
+diff --git a/README.md b/README.md
+index c40f950b..49b0ba2a 100644
+--- a/README.md
++++ b/README.md
+@@ -97,3 +97,91 @@ Handshake mode: RTT0
+ Early data accepted: True
+ Result: (Z) 0-RTT ... OK
+ ```
++
++## OCSP Stapling Support
++
++This TLS library supports OCSP (Online Certificate Status Protocol) stapling for both TLS 1.2 and TLS 1.3, allowing servers to provide certificate revocation status during the TLS handshake.
++
++### Hook Configuration
++
++OCSP stapling is configured through the `onCertificateStatus` hook in `ServerHooks`:
++
++```haskell
++onCertificateStatus :: CertificateChain -> Maybe HostName -> IO (Maybe ByteString)
++```
++
++**Parameters:**
++- `CertificateChain`: The complete certificate chain the server is presenting (leaf → intermediate → root)
++- `Maybe HostName`: The SNI (Server Name Indication) hostname requested by the client, if any
++- **Returns:** `Maybe ByteString` - raw DER-encoded OCSP response, or `Nothing` if unavailable
++
++### How It Works
++
++**TLS 1.2:**
++1. Client sends ClientHello with `status_request` extension
++2. Server calls the OCSP hook with the certificate chain and SNI
++3. If hook returns `Just ocspDer`, server sends a separate `CertificateStatus` message
++4. OCSP response uses 24-bit length encoding per RFC 6066
++
++**TLS 1.3:**
++1. Client sends ClientHello with `status_request` extension
++2. Server calls the OCSP hook with the certificate chain and SNI
++3. If hook returns `Just ocspDer`, server embeds OCSP response as a certificate extension
++4. OCSP response is wrapped in `CertificateStatus` format and attached to the leaf certificate
++
++### Example Implementation
++
++```haskell
++import Network.TLS
++import qualified Data.ByteString as B
++import Data.X509
++
++-- Simple OCSP hook that serves cached responses
++myOCSPHook :: CertificateChain -> Maybe HostName -> IO (Maybe B.ByteString)
++myOCSPHook (CertificateChain certs) mSNI = do
++    case certs of
++        [] -> return Nothing
++        (leafCert:_) -> do
++            -- Extract identifier from leaf certificate
++            let serialNumber = certSerial $ signedObject $ getSigned leafCert
++            
++            -- Look up cached OCSP response
++            -- In production, this might query a cache, database, or OCSP responder
++            mOcspResponse <- case mSNI of
++                Just hostname -> lookupOCSPByHostname hostname serialNumber
++                Nothing -> lookupOCSPBySerial serialNumber
++                
++            return mOcspResponse
++
++-- Configure server with OCSP support
++serverParams = def 
++    { serverHooks = def 
++        { onCertificateStatus = myOCSPHook 
++        }
++    , serverShared = def
++        { sharedCredentials = myCredentials
++        }
++    }
++```
++
++### Key Points
++
++1. **Leaf Certificate Only**: OCSP stapling applies only to the leaf (server) certificate, not intermediate certificates
++2. **SNI Support**: The hook receives SNI information, enabling per-hostname OCSP responses for multi-domain servers
++3. **Protocol Agnostic**: The same hook works for both TLS 1.2 and 1.3; the library handles protocol differences
++4. **Optional**: If the hook returns `Nothing`, the handshake continues without OCSP stapling
++5. **Must-Staple**: The library supports RFC 7633 must-staple validation if configured
++
++### Testing OCSP
++
++Test OCSP stapling with OpenSSL:
++
++```bash
++# TLS 1.2
++openssl s_client -connect example.com:443 -tls1_2 -status
++
++# TLS 1.3  
++openssl s_client -connect example.com:443 -tls1_3 -status
++```
++
++Look for "OCSP response:" in the output to confirm stapling is working.
+-- 
+2.50.0
+

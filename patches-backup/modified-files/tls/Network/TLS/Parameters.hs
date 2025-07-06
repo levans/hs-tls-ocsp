@@ -1,17 +1,23 @@
 module Network.TLS.Parameters (
     ClientParams (..),
+    defaultParamsClient,
     ServerParams (..),
+    defaultParamsServer,
     CommonParams,
     DebugParams (..),
+    defaultDebugParams,
     ClientHooks (..),
+    defaultClientHooks,
     OnCertificateRequest,
     OnServerCertificate,
     ServerHooks (..),
+    defaultServerHooks,
     Supported (..),
+    defaultSupported,
     Shared (..),
-
-    -- * special default
-    defaultParamsClient,
+    defaultShared,
+    Limit (..),
+    defaultLimit,
 
     -- * Parameters
     MaxFragmentEnum (..),
@@ -23,7 +29,7 @@ module Network.TLS.Parameters (
 ) where
 
 import qualified Data.ByteString as B
-import Data.Default.Class
+import Data.Default (Default (def))
 import Network.TLS.Cipher
 import Network.TLS.Compression
 import Network.TLS.Credentials
@@ -65,6 +71,7 @@ data DebugParams = DebugParams
     -- Default: no printing
     }
 
+-- | Default value for 'DebugParams'
 defaultDebugParams :: DebugParams
 defaultDebugParams =
     DebugParams
@@ -78,6 +85,8 @@ instance Show DebugParams where
     show _ = "DebugParams"
 instance Default DebugParams where
     def = defaultDebugParams
+
+{-# DEPRECATED clientUseMaxFragmentLength "UseMaxFragmentLength is deprecated" #-}
 
 data ClientParams = ClientParams
     { clientUseMaxFragmentLength :: Maybe MaxFragmentEnum
@@ -133,9 +142,16 @@ data ClientParams = ClientParams
     -- is automatically re-sent.
     --
     -- Default: 'False'
+    , clientEnforceMustStaple :: Bool
+    -- ^ Whether to enforce must-staple certificate requirement strictly.
+    -- If True, connections fail when must-staple certificates can't provide OCSP stapling.
+    -- If False, connections continue with a warning.
+    --
+    -- Default: True (RFC 7633 compliant)
     }
     deriving (Show)
 
+-- | Default value for 'ClientParams'
 defaultParamsClient :: HostName -> ByteString -> ClientParams
 defaultParamsClient serverName serverId =
     ClientParams
@@ -149,6 +165,7 @@ defaultParamsClient serverName serverId =
         , clientSupported = def
         , clientDebug = defaultDebugParams
         , clientUseEarlyData = False
+        , clientEnforceMustStaple = True
         }
 
 data ServerParams = ServerParams
@@ -190,6 +207,20 @@ data ServerParams = ServerParams
     -- Acceptable value range is 0 to 604800 (7 days).
     --
     -- Default: 7200 (2 hours)
+    , serverLimit :: Limit
+    
+    -- | OCSP timeout in microseconds for HTTP/2 connections.
+    -- If OCSP hook takes longer than this, connection continues without OCSP stapling.
+    --
+    -- Default: 2000000 (2 seconds)
+    , serverOCSPTimeoutMicros :: Int
+    
+    -- | Whether to enforce must-staple certificate requirement strictly.
+    -- If True, connections fail when must-staple certificates can't provide OCSP stapling.
+    -- If False, connections continue with a warning.
+    --
+    -- Default: True (RFC 7633 compliant)
+    , serverEnforceMustStaple :: Bool
     }
     deriving (Show)
 
@@ -205,6 +236,9 @@ defaultParamsServer =
         , serverDebug = defaultDebugParams
         , serverEarlyDataSize = 0
         , serverTicketLifetime = 7200
+        , serverLimit = defaultLimit
+        , serverOCSPTimeoutMicros = 2000000  -- 2 seconds
+        , serverEnforceMustStaple = True     -- RFC 7633 compliant
         }
 
 instance Default ServerParams where
@@ -327,7 +361,7 @@ data Supported = Supported
     --   The default value includes all groups with security strength of 128
     --   bits or more.
     --
-    --   Default: @[X25519,X448,P256,FFDHE3072,FFDHE4096,P384,FFDHE6144,FFDHE8192,P521]@
+    --   Default: @[X25519,X448,P256,FFDHE2048,FFDHE3072,FFDHE4096,P384,FFDHE6144,FFDHE8192,P521]@
     }
     deriving (Show, Eq)
 
@@ -404,19 +438,27 @@ data Shared = Shared
     -- based on the TLS version.
     --
     -- Default: @[]@
+    , sharedLimit :: Limit
+    -- ^ Limitation parameters.
+    --
+    -- @since 2.1.8
     }
 
 instance Show Shared where
     show _ = "Shared"
 instance Default Shared where
-    def =
-        Shared
-            { sharedCredentials = mempty
-            , sharedSessionManager = noSessionManager
-            , sharedCAStore = mempty
-            , sharedValidationCache = def
-            , sharedHelloExtensions = []
-            }
+    def = defaultShared
+
+defaultShared :: Shared
+defaultShared =
+    Shared
+        { sharedCredentials = mempty
+        , sharedSessionManager = noSessionManager
+        , sharedCAStore = mempty
+        , sharedValidationCache = def
+        , sharedHelloExtensions = []
+        , sharedLimit = defaultLimit
+        }
 
 -- | Group usage callback possible return values.
 data GroupUsage
@@ -550,6 +592,16 @@ data ClientHooks = ClientHooks
     --   See RFC 7919 section 3.1 for recommandations.
     , onServerFinished :: Information -> IO ()
     -- ^ When a handshake is done, this hook can check `Information`.
+    , onServerCertificateStatus :: CertificateChain -> ByteString -> IO CertificateUsage
+    -- ^ Called when the server provides an OCSP response for certificate stapling.
+    -- The first parameter is the server's certificate chain being validated.
+    -- The second parameter is the DER-encoded OCSP response from the server.
+    -- Return 'CertificateUsageAccept' to accept the certificate, or
+    -- 'CertificateUsageReject' with a reason to reject it.
+    -- This allows the client to validate the OCSP response and enforce
+    -- certificate revocation policies.
+    --
+    -- Default: 'return CertificateUsageAccept' (accept any OCSP response)
     }
 
 defaultClientHooks :: ClientHooks
@@ -560,6 +612,7 @@ defaultClientHooks =
         , onSuggestALPN = return Nothing
         , onCustomFFDHEGroup = defaultGroupUsage 1024
         , onServerFinished = \_ -> return ()
+        , onServerCertificateStatus = \_ _ -> return CertificateUsageAccept
         }
 
 instance Show ClientHooks where
@@ -640,6 +693,7 @@ data ServerHooks = ServerHooks
     -- Default: '\_ _ -> return Nothing' (no OCSP stapling)
     }
 
+-- | Default value for 'ServerHooks'
 defaultServerHooks :: ServerHooks
 defaultServerHooks =
     ServerHooks
@@ -648,7 +702,9 @@ defaultServerHooks =
                 CertificateUsageReject $
                     CertificateRejectOther "no client certificates expected"
         , onUnverifiedClientCert = return False
-        , onCipherChoosing = \_ -> head
+        , onCipherChoosing = \_ ccs -> case ccs of
+            [] -> error "onCipherChoosing: no compatible ciphers - configuration error"  
+            c : _ -> c
         , onServerNameIndication = \_ -> return mempty
         , onNewHandshake = \_ -> return True
         , onALPNClientSuggest = Nothing
@@ -676,3 +732,36 @@ data Information = Information
     , infoIsEarlyDataAccepted :: Bool
     }
     deriving (Show, Eq)
+
+-- | Limitations for security.
+--
+-- @since 2.1.7
+data Limit = Limit
+    { limitRecordSize :: Maybe Int
+    -- ^ Record size limit defined in RFC 8449.
+    --
+    -- If 'Nothing', the "record_size_limit" extension is not used.
+    --
+    -- In the case of 'Just': A client sends the "record_size_limit"
+    -- extension with this value to the server. A server sends back
+    -- this extension with its own value if a client sends the
+    -- extension. When negotiated, both my limit and peer's limit
+    -- are enabled for protected communication.
+    --
+    -- Default: Nothing
+    , limitHandshakeFragment :: Int
+    -- ^ The limit to accept the number of each handshake message.
+    -- For instance, a nasty client may send many fragments of client
+    -- certificate.
+    --
+    -- Default: 32
+    }
+    deriving (Eq, Show)
+
+-- | Default value for 'Limit'.
+defaultLimit :: Limit
+defaultLimit =
+    Limit
+        { limitRecordSize = Nothing
+        , limitHandshakeFragment = 32
+        }

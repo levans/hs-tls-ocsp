@@ -1,0 +1,78 @@
+From 9ab85aed5b899a041d315dd20918a67d4f35100d Mon Sep 17 00:00:00 2001
+From: Luke Evans <luke.evans@gmail.com>
+Date: Wed, 2 Jul 2025 08:47:21 -0700
+Subject: [PATCH 2/9] Fix critical OCSP hook signature regression
+
+- Restore onCertificateStatus to take CertificateChain and Maybe HostName parameters
+- This provides the certificate chain and SNI information needed by consumers
+- Matches the original 2.1.10 implementation design
+- Fixes API consistency with other hooks that take direct parameters
+- No more unnecessary Maybe wrapper around the hook function itself
+---
+ tls/Network/TLS/Handshake/Server/ServerHello12.hs | 3 ++-
+ tls/Network/TLS/Handshake/Server/ServerHello13.hs | 3 ++-
+ tls/Network/TLS/Parameters.hs                     | 8 +++++---
+ 3 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/tls/Network/TLS/Handshake/Server/ServerHello12.hs b/tls/Network/TLS/Handshake/Server/ServerHello12.hs
+index d4df2405..c19e474d 100644
+--- a/tls/Network/TLS/Handshake/Server/ServerHello12.hs
++++ b/tls/Network/TLS/Handshake/Server/ServerHello12.hs
+@@ -135,7 +135,8 @@ sendServerFirstFlight ServerParams{..} ctx usedCipher mcred chExts = do
+     -- Also handle must-staple certificate validation
+     b3 <- if hasStatusRequest chExts
+         then do
+-            mOcspResponse <- onCertificateStatus serverHooks
++            clientSNI <- usingState_ ctx getClientSNI
++            mOcspResponse <- onCertificateStatus serverHooks cc clientSNI
+             case mOcspResponse of
+                 Just ocspDer -> return $ b2 . (CertificateStatus ocspDer :)
+                 Nothing -> do
+diff --git a/tls/Network/TLS/Handshake/Server/ServerHello13.hs b/tls/Network/TLS/Handshake/Server/ServerHello13.hs
+index cc830cc3..3fc9d185 100644
+--- a/tls/Network/TLS/Handshake/Server/ServerHello13.hs
++++ b/tls/Network/TLS/Handshake/Server/ServerHello13.hs
+@@ -259,7 +259,8 @@ sendServerHello13 sparams ctx clientKeyShare (usedCipher, usedHash, rtt0) CH{..}
+         -- Also handle must-staple certificate validation
+         ess <- if hasStatusRequest chExtensions && not (null cs)
+             then do
+-                mOcspResponse <- liftIO $ onCertificateStatus (serverHooks sparams)
++                clientSNI <- liftIO $ usingState_ ctx getClientSNI
++                mOcspResponse <- liftIO $ onCertificateStatus (serverHooks sparams) certChain clientSNI
+                 case mOcspResponse of
+                     Just ocspDer ->
+                         -- Add OCSP extension to the leaf certificate only
+diff --git a/tls/Network/TLS/Parameters.hs b/tls/Network/TLS/Parameters.hs
+index 0b4dd835..a4dab537 100644
+--- a/tls/Network/TLS/Parameters.hs
++++ b/tls/Network/TLS/Parameters.hs
+@@ -649,13 +649,15 @@ data ServerHooks = ServerHooks
+     --  of TLS 1.3.
+     --
+     -- Default: 'return'
+-    , onCertificateStatus :: IO (Maybe ByteString)
++    , onCertificateStatus :: CertificateChain -> Maybe HostName -> IO (Maybe ByteString)
+     -- ^ Called when the server needs to provide an OCSP response for certificate stapling.
++    -- The first parameter is the certificate chain being used for this connection.
++    -- The second parameter is the server name indication (SNI) from the client, if any.
+     -- Return 'Nothing' to disable stapling, or 'Just' a DER-encoded OCSP response.
+     -- This is called after certificate selection and should provide a response
+     -- corresponding to the certificate being used.
+     --
+-    -- Default: 'Nothing' (no OCSP stapling)
++    -- Default: '\_ _ -> return Nothing' (no OCSP stapling)
+     }
+ 
+ -- | Default value for 'ServerHooks'
+@@ -674,7 +676,7 @@ defaultServerHooks =
+         , onNewHandshake = \_ -> return True
+         , onALPNClientSuggest = Nothing
+         , onEncryptedExtensionsCreating = return
+-        , onCertificateStatus = return Nothing
++        , onCertificateStatus = \_ _ -> return Nothing
+         }
+ 
+ instance Show ServerHooks where
+-- 
+2.50.0
+

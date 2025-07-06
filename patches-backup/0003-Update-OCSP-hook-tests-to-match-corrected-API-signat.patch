@@ -1,0 +1,195 @@
+From 018082ac8514c839df92a21f4dd8d4db3719d0c5 Mon Sep 17 00:00:00 2001
+From: Luke Evans <luke.evans@gmail.com>
+Date: Wed, 2 Jul 2025 08:52:21 -0700
+Subject: [PATCH 3/9] Update OCSP hook tests to match corrected API signature
+
+- Update all tests to use new CertificateChain -> Maybe HostName -> IO (Maybe ByteString) signature
+- Add test case to verify hook receives certificate chain and SNI parameters
+- All OCSP hook tests now pass successfully
+---
+ tls/test/OCSPHookSpec.hs | 79 +++++++++++++++++++++++++++-------------
+ 1 file changed, 53 insertions(+), 26 deletions(-)
+
+diff --git a/tls/test/OCSPHookSpec.hs b/tls/test/OCSPHookSpec.hs
+index 748a209a..94a32844 100644
+--- a/tls/test/OCSPHookSpec.hs
++++ b/tls/test/OCSPHookSpec.hs
+@@ -8,40 +8,49 @@ import Network.TLS.X509
+ import Data.IORef
+ import Control.Exception (ErrorCall(..), catch)
+ import qualified Data.ByteString as B
++import Data.X509 (CertificateChain(..))
+ 
+ -- Mock OCSP response (simplified DER-encoded structure)
+ mockOcspResponse :: B.ByteString
+ mockOcspResponse = B.pack [0x30, 0x82, 0x01, 0x00] -- Basic DER SEQUENCE header
+ 
++-- Mock certificate chain for testing
++mockCertChain :: CertificateChain
++mockCertChain = CertificateChain []  -- Empty chain for testing
++
++-- Mock SNI hostname
++mockSNI :: Maybe HostName
++mockSNI = Just "example.com"
++
+ spec :: Spec
+ spec = describe "OCSP Hook Execution" $ do
+     describe "onCertificateStatus hook" $ do
+         it "can return OCSP response" $ do
+-            let hook = return $ Just mockOcspResponse
+-            result <- hook
++            let hook = \_ _ -> return $ Just mockOcspResponse
++            result <- hook mockCertChain mockSNI
+             result `shouldBe` Just mockOcspResponse
+ 
+         it "can disable OCSP by returning Nothing" $ do
+-            let hook = return Nothing
+-            result <- hook
++            let hook = \_ _ -> return Nothing
++            result <- hook mockCertChain mockSNI
+             result `shouldBe` (Nothing :: Maybe B.ByteString)
+ 
+         it "hook is called during server parameter creation" $ do
+             hookCallCounter <- newIORef (0 :: Int)
+-            let trackingHook = do
++            let trackingHook _ _ = do
+                     modifyIORef hookCallCounter (+1)
+                     return $ Just mockOcspResponse
+                 
+                 serverParams = defaultServerHooks { onCertificateStatus = trackingHook }
+             
+             -- Simulate hook call
+-            _ <- onCertificateStatus serverParams
++            _ <- onCertificateStatus serverParams mockCertChain mockSNI
+             callCount <- readIORef hookCallCounter
+             callCount `shouldBe` 1
+ 
+         it "hook can be called multiple times" $ do
+             responses <- newIORef ([] :: [Maybe B.ByteString])
+-            let loggingHook = do
++            let loggingHook _ _ = do
+                     let response = Just mockOcspResponse
+                     modifyIORef responses (response:)
+                     return response
+@@ -49,9 +58,9 @@ spec = describe "OCSP Hook Execution" $ do
+                 serverParams = defaultServerHooks { onCertificateStatus = loggingHook }
+             
+             -- Call hook multiple times
+-            _ <- onCertificateStatus serverParams
+-            _ <- onCertificateStatus serverParams
+-            _ <- onCertificateStatus serverParams
++            _ <- onCertificateStatus serverParams mockCertChain mockSNI
++            _ <- onCertificateStatus serverParams mockCertChain mockSNI
++            _ <- onCertificateStatus serverParams mockCertChain mockSNI
+             
+             allResponses <- readIORef responses
+             length allResponses `shouldBe` 3
+@@ -59,27 +68,27 @@ spec = describe "OCSP Hook Execution" $ do
+ 
+     describe "Hook integration with ServerHooks" $ do
+         it "default hook returns Nothing" $ do
+-            result <- onCertificateStatus defaultServerHooks
++            result <- onCertificateStatus defaultServerHooks mockCertChain mockSNI
+             result `shouldBe` Nothing
+ 
+         it "can override default hook" $ do
+             let customHooks = defaultServerHooks { 
+-                    onCertificateStatus = return $ Just mockOcspResponse 
++                    onCertificateStatus = \_ _ -> return $ Just mockOcspResponse 
+                 }
+-            result <- onCertificateStatus customHooks
++            result <- onCertificateStatus customHooks mockCertChain mockSNI
+             result `shouldBe` Just mockOcspResponse
+ 
+         it "hook maintains independence from other hooks" $ do
+             clientCertHookCalled <- newIORef False
+             let customHooks = defaultServerHooks { 
+-                    onCertificateStatus = return $ Just mockOcspResponse,
++                    onCertificateStatus = \_ _ -> return $ Just mockOcspResponse,
+                     onClientCertificate = \_ -> do
+                         writeIORef clientCertHookCalled True
+                         return $ CertificateUsageAccept
+                 }
+             
+             -- Call OCSP hook
+-            ocspResult <- onCertificateStatus customHooks
++            ocspResult <- onCertificateStatus customHooks mockCertChain mockSNI
+             ocspResult `shouldBe` Just mockOcspResponse
+             
+             -- Verify other hook wasn't affected
+@@ -88,10 +97,10 @@ spec = describe "OCSP Hook Execution" $ do
+ 
+     describe "Hook error handling" $ do
+         it "can handle hook that throws exception" $ do
+-            let errorHook = error "OCSP service unavailable"
++            let errorHook _ _ = error "OCSP service unavailable"
+                 serverParams = defaultServerHooks { onCertificateStatus = errorHook }
+             
+-            result <- (onCertificateStatus serverParams >> return (Left "should not reach here")) 
++            result <- (onCertificateStatus serverParams mockCertChain mockSNI >> return (Left "should not reach here")) 
+                       `catch` (\e -> return $ Right $ show (e :: ErrorCall))
+             
+             case result of
+@@ -100,30 +109,48 @@ spec = describe "OCSP Hook Execution" $ do
+ 
+     describe "Hook response validation" $ do
+         it "accepts valid DER-encoded response" $ do
+-            let hook = return $ Just mockOcspResponse
+-            result <- hook
++            let hook = \_ _ -> return $ Just mockOcspResponse
++            result <- hook mockCertChain mockSNI
+             case result of
+                 Just response -> B.length response `shouldSatisfy` (> 0)
+                 Nothing -> expectationFailure "Expected OCSP response"
+ 
+         it "accepts empty response as None" $ do
+-            let hook = return Nothing
+-            result <- hook
++            let hook = \_ _ -> return Nothing
++            result <- hook mockCertChain mockSNI
+             result `shouldBe` (Nothing :: Maybe B.ByteString)
+ 
+         it "can return different responses on subsequent calls" $ do
+             callCount <- newIORef (0 :: Int)
+-            let dynamicHook = do
++            let dynamicHook _ _ = do
+                     count <- readIORef callCount
+                     modifyIORef callCount (+1)
+                     if even count
+                         then return $ Just mockOcspResponse
+                         else return Nothing
+             
+-            result1 <- dynamicHook
+-            result2 <- dynamicHook
+-            result3 <- dynamicHook
++            result1 <- dynamicHook mockCertChain mockSNI
++            result2 <- dynamicHook mockCertChain mockSNI
++            result3 <- dynamicHook mockCertChain mockSNI
+             
+             result1 `shouldBe` Just mockOcspResponse
+             result2 `shouldBe` Nothing
+-            result3 `shouldBe` Just mockOcspResponse
+\ No newline at end of file
++            result3 `shouldBe` Just mockOcspResponse
++
++        it "hook receives certificate chain and SNI parameters" $ do
++            receivedChain <- newIORef Nothing
++            receivedSNI <- newIORef Nothing
++            let captureHook chain sni = do
++                    writeIORef receivedChain (Just chain)
++                    writeIORef receivedSNI (Just sni)
++                    return $ Just mockOcspResponse
++                
++                serverParams = defaultServerHooks { onCertificateStatus = captureHook }
++            
++            _ <- onCertificateStatus serverParams mockCertChain mockSNI
++            
++            capturedChain <- readIORef receivedChain
++            capturedSNI <- readIORef receivedSNI
++            
++            capturedChain `shouldBe` Just mockCertChain
++            capturedSNI `shouldBe` Just mockSNI
+\ No newline at end of file
+-- 
+2.50.0
+

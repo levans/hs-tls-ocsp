@@ -42,7 +42,6 @@ module Network.TLS (
     -- ** Client parameters
     ClientParams,
     defaultParamsClient,
-    clientUseMaxFragmentLength,
     clientServerIdentification,
     clientUseServerNameIndication,
     clientWantSessionResume,
@@ -55,6 +54,7 @@ module Network.TLS (
 
     -- ** Server parameters
     ServerParams,
+    defaultParamsServer,
     serverWantClientCert,
     serverCACertificates,
     serverDHEParams,
@@ -67,14 +67,17 @@ module Network.TLS (
 
     -- ** Shared
     Shared,
+    defaultShared,
     sharedCredentials,
     sharedSessionManager,
     sharedCAStore,
     sharedValidationCache,
     sharedHelloExtensions,
+    sharedLimit,
 
     -- ** Client hooks
     ClientHooks,
+    defaultClientHooks,
     OnCertificateRequest,
     onCertificateRequest,
     OnServerCertificate,
@@ -88,6 +91,7 @@ module Network.TLS (
 
     -- ** Server hooks
     ServerHooks,
+    defaultServerHooks,
     onClientCertificate,
     onUnverifiedClientCert,
     onCipherChoosing,
@@ -103,6 +107,7 @@ module Network.TLS (
 
     -- ** Supported
     Supported,
+    defaultSupported,
     supportedVersions,
     supportedCiphers,
     supportedCompressions,
@@ -117,10 +122,17 @@ module Network.TLS (
 
     -- ** Debug parameters
     DebugParams,
+    defaultDebugParams,
     debugSeed,
     debugPrintSeed,
     debugVersionForced,
     debugKeyLogger,
+
+    -- ** Limit parameters
+    Limit,
+    defaultLimit,
+    limitHandshakeFragment,
+    limitRecordSize,
 
     -- * Shared parameters
 
@@ -162,6 +174,7 @@ module Network.TLS (
 
     -- ** Validation Cache
     ValidationCache (..),
+    -- defaultValidationCache, -- Not available in this version
     ValidationCacheQueryCallback,
     ValidationCacheAddCallback,
     ValidationCacheResult (..),
@@ -188,6 +201,7 @@ module Network.TLS (
     CertificateUsage (..),
     CertificateRejectReason (..),
     CertificateType (..),
+    CertificateChain (..),
     HostName,
     MaxFragmentEnum (..),
 
@@ -235,6 +249,7 @@ module Network.TLS (
 
     -- ** Modifying hooks in context
     Hooks,
+    defaultHooks,
     hookRecvHandshake,
     hookRecvHandshake13,
     hookRecvCertificates,
@@ -246,6 +261,7 @@ module Network.TLS (
     contextHookSetHandshake13Recv,
     contextHookSetCertificateRecv,
     Logging,
+    defaultLogging,
     loggingPacketSent,
     loggingPacketRecv,
     loggingIOSent,
@@ -282,6 +298,7 @@ module Network.TLS (
     Bytes,
     ValidationChecks (..),
     ValidationHooks (..),
+    clientUseMaxFragmentLength,
 ) where
 
 import Network.TLS.Backend (Backend (..), HasBackend (..))
@@ -328,7 +345,7 @@ import Network.TLS.X509
 
 import Data.ByteString as B
 import Data.X509 (PrivKey (..), PubKey (..))
-import Data.X509.Validation hiding (HostName)
+import Data.X509.Validation hiding (HostName, defaultHooks)
 
 {-# DEPRECATED Bytes "Use Data.ByteString.Bytestring instead of Bytes." #-}
 type Bytes = B.ByteString

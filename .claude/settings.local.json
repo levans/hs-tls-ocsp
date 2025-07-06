@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rg:*)",
+      "Bash(cabal build:*)",
+      "Bash(openssl:*)",
+      "Bash(./tls12-compliance-test.sh:*)",
+      "Bash(chmod:*)",
+      "Bash(./simple-tls-test.sh:*)",
+      "Bash(timeout:*)",
+      "Bash(stack build:*)",
+      "Bash(stack ghc:*)",
+      "Bash(./quick-ocsp-test)",
+      "Bash(stack exec tls-ocsp-test:*)",
+      "Bash(grep:*)",
+      "Bash(cp:*)",
+      "Bash(./run-ocsp-tests.sh:*)",
+      "Bash(./test-ocsp-stapling.sh:*)",
+      "Bash(echo:*)",
+      "Bash(ls:*)",
+      "Bash(mkdir:*)",
+      "Bash(git format-patch:*)",
+      "Bash(git cherry-pick:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(sed:*)",
+      "Bash(stack test:*)",
+      "Bash(find:*)",
+      "Bash(runhaskell:*)"
+    ],
+    "deny": []
+  }
+}

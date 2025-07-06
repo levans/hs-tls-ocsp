@@ -174,6 +174,7 @@ module Network.TLS.Struct (
         HandshakeType_CertVerify,
         HandshakeType_ClientKeyXchg,
         HandshakeType_Finished,
+        HandshakeType_CertificateStatus,
         HandshakeType_KeyUpdate
     ),
     Handshake (..),
@@ -767,6 +768,8 @@ pattern HandshakeType_ClientKeyXchg       :: HandshakeType
 pattern HandshakeType_ClientKeyXchg        = HandshakeType 16
 pattern HandshakeType_Finished            :: HandshakeType
 pattern HandshakeType_Finished             = HandshakeType 20
+pattern HandshakeType_CertificateStatus   :: HandshakeType
+pattern HandshakeType_CertificateStatus    = HandshakeType 22
 pattern HandshakeType_KeyUpdate           :: HandshakeType
 pattern HandshakeType_KeyUpdate            = HandshakeType 24
 
@@ -781,6 +784,7 @@ instance Show HandshakeType where
     show HandshakeType_CertVerify       = "HandshakeType_CertVerify"
     show HandshakeType_ClientKeyXchg    = "HandshakeType_ClientKeyXchg"
     show HandshakeType_Finished         = "HandshakeType_Finished"
+    show HandshakeType_CertificateStatus = "HandshakeType_CertificateStatus"
     show HandshakeType_NewSessionTicket = "HandshakeType_NewSessionTicket"
     show (HandshakeType x)              = "HandshakeType " ++ show x
 {- FOURMOLU_ENABLE -}
@@ -896,6 +900,7 @@ data Handshake
     | CertVerify DigitallySigned
     | Finished VerifyData
     | NewSessionTicket Second Ticket
+    | CertificateStatus ByteString
     deriving (Show, Eq)
 
 {- FOURMOLU_DISABLE -}
@@ -917,4 +922,5 @@ typeOfHandshake CertRequest{}      = HandshakeType_CertRequest
 typeOfHandshake CertVerify{}       = HandshakeType_CertVerify
 typeOfHandshake Finished{}         = HandshakeType_Finished
 typeOfHandshake NewSessionTicket{} = HandshakeType_NewSessionTicket
+typeOfHandshake CertificateStatus{} = HandshakeType_CertificateStatus
 {- FOURMOLU_ENABLE -}

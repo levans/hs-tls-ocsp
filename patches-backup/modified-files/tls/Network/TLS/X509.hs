@@ -10,6 +10,7 @@ module Network.TLS.X509 (
     CertificateUsage (..),
     CertificateStore,
     ValidationCache,
+    -- defaultValidationCache, -- Not available in this version
     exceptionValidationCache,
     validateDefault,
     FailedReason,
@@ -33,9 +34,9 @@ import qualified Data.ByteString as B
 isNullCertificateChain :: CertificateChain -> Bool
 isNullCertificateChain (CertificateChain l) = null l
 
-getCertificateChainLeaf :: CertificateChain -> SignedExact Certificate
-getCertificateChainLeaf (CertificateChain []) = error "empty certificate chain"
-getCertificateChainLeaf (CertificateChain (x : _)) = x
+getCertificateChainLeaf :: CertificateChain -> Maybe (SignedExact Certificate)
+getCertificateChainLeaf (CertificateChain []) = Nothing
+getCertificateChainLeaf (CertificateChain (x : _)) = Just x
 
 -- | Certificate and Chain rejection reason
 data CertificateRejectReason
@@ -67,14 +68,25 @@ wrapCertificateChecks l
 pubkeyType :: PubKey -> String
 pubkeyType = show . pubkeyToAlg
 
--- | Validate a client certificate using store and cache
-validateClientCertificate :: CertificateStore -> ValidationCache -> CertificateChain -> IO [FailedReason]
+-- | A utility function for client authentication which can be used
+-- `onClientCertificate`.
+--
+-- Since: 2.1.7
+validateClientCertificate
+    :: CertificateStore
+    -> ValidationCache
+    -> CertificateChain
+    -> IO CertificateUsage
 validateClientCertificate store cache cc =
-    validateDefault
-        store
-        cache
-        ("", mempty)
-        cc
+    wrapCertificateChecks
+        <$> validate
+            HashSHA256
+            defaultHooks
+            defaultChecks{checkFQHN = False}
+            store
+            cache
+            ("", mempty)
+            cc
 
 -- | Check if a certificate has the TLS Feature extension with must-staple (RFC 7633)
 -- TLS Feature extension OID: 1.3.6.1.5.5.7.1.24
@@ -121,6 +133,6 @@ hasStatusRequestFeature asn1 = 5 `elem` extractIntegers 10 asn1  -- Max depth of
 -- | Check if any certificate in the chain requires OCSP stapling
 -- According to RFC 7633, only the leaf certificate's must-staple matters
 certificateChainRequiresStapling :: CertificateChain -> Bool
-certificateChainRequiresStapling cc
-    | isNullCertificateChain cc = False
-    | otherwise = hasMustStapleExtension (getCertificate (getCertificateChainLeaf cc))
+certificateChainRequiresStapling (CertificateChain []) = False
+certificateChainRequiresStapling (CertificateChain (leafCert : _)) =
+    hasMustStapleExtension (getCertificate leafCert)
