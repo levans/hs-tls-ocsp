@@ -100,7 +100,7 @@ test_tls_connection() {
             $openssl_version \
             -status \
             -verify_return_error \
-            -CAfile "../ca.crt" \
+            -CAfile "../test-certs/ca.crt" \
             > "$output_file" 2>&1
     
     local client_exit_code=$?
@@ -235,11 +235,11 @@ run_all_tests() {
 }
 
 # Check if certificates exist
-if [[ ! -f "../server.crt" || ! -f "../server.key" || ! -f "../ca.crt" ]]; then
+if [[ ! -f "../test-certs/server.rsa.crt" || ! -f "../test-certs/server.rsa.key" || ! -f "../test-certs/ca.crt" ]]; then
     log_error "Required certificates not found. Expected files:"
-    log_error "  ../server.crt"
-    log_error "  ../server.key" 
-    log_error "  ../ca.crt"
+    log_error "  ../test-certs/server.rsa.crt"
+    log_error "  ../test-certs/server.rsa.key" 
+    log_error "  ../test-certs/ca.crt"
     exit 1
 fi
 

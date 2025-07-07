@@ -110,8 +110,8 @@ defaultServerConfig :: ServerConfig
 defaultServerConfig = ServerConfig
     { configPort = 4443
     , configTlsVersion = Nothing
-    , configCertFile = "../server.crt"
-    , configKeyFile = "../server.key"
+    , configCertFile = "../test-certs/server.rsa.crt"
+    , configKeyFile = "../test-certs/server.rsa.key"
     , configVerbose = False
     }
 
