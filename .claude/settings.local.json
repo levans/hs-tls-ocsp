@@ -27,7 +27,8 @@
       "Bash(stack test:*)",
       "Bash(find:*)",
       "Bash(runhaskell:*)",
-      "Bash(git rm:*)"
+      "Bash(git rm:*)",
+      "Bash(make:*)"
     ],
     "deny": []
   }

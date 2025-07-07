@@ -19,3 +19,6 @@ test-scripts/openssl-client
 *.log
 .stack-work/
 dist-newstyle/
+
+# Claude configuration (keep local but don't track)
+CLAUDE.md
