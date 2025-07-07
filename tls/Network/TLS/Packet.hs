@@ -311,18 +311,8 @@ decodeServerKeyXchg cp =
         Just cke -> ServerKeyXchg <$> decodeServerKeyXchgAlgorithmData (cParamsVersion cp) cke
         Nothing -> ServerKeyXchg . SKX_Unparsed <$> (remaining >>= getBytes)
 
-decodeFinished :: Get Handshake
-decodeFinished = Finished . VerifyData <$> (remaining >>= getBytes)
-
-decodeCertificateStatus :: Get Handshake
-decodeCertificateStatus = do
-    statusType <- getWord8
-    when (statusType /= 1) $ fail "unknown certificate status type"
-    CertificateStatus <$> getOpaque24
-
 ----------------------------------------------------------------
 -- encode HANDSHAKE
->>>>>>> ab22c5f2 (Fix client protos for stapling in 1.2 and 1.3.  Add solid test for server hook and openssl client in 1.2 and 1.3)
 
 encodeHandshake :: Handshake -> ByteString
 encodeHandshake o =
@@ -384,7 +374,7 @@ encodeHandshake' (ClientKeyXchg ckx) = runPut $ do
         CKX_RSA encryptedPreMain -> putBytes encryptedPreMain
         CKX_DH clientDHPublic -> putInteger16 $ dhUnwrapPublic clientDHPublic
         CKX_ECDH bytes -> putOpaque8 bytes
-encodeHandshake' (Finished (VerifyData opaque)) = runPut $ putBytes opaque
+encodeHandshake' (Finished opaque) = runPut $ putBytes opaque
 encodeHandshake' (NewSessionTicket life ticket) = runPut $ do
     putWord32 life
     putOpaque16 ticket

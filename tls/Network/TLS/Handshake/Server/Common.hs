@@ -8,6 +8,7 @@ module Network.TLS.Handshake.Server.Common (
     filterCredentials,
     filterCredentialsWithHashSignatures,
     isCredentialAllowed,
+    makeCredentialPredicate,
     storePrivInfoServer,
 ) where
 

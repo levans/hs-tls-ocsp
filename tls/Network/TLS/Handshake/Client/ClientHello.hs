@@ -127,6 +127,7 @@ sendClientHello' cparams ctx groups crand (pskInfo, rtt0info, rtt0) = do
             , groupExtension
             , ecPointExtension
             , sessionTicketExtension
+            , statusRequestExtension
             , signatureAlgExtension
             , -- , heartbeatExtension
               versionExtension
@@ -185,6 +186,11 @@ sendClientHello' cparams ctx groups crand (pskInfo, rtt0info, rtt0) = do
             (sidOrTkt, _) : _
                 | isTicket sidOrTkt -> return $ Just $ toExtensionRaw $ SessionTicket sidOrTkt
             _ -> return $ Just $ toExtensionRaw $ SessionTicket ""
+
+    statusRequestExtension =
+        if clientUseOCSP cparams
+            then return $ Just $ toExtensionRaw StatusRequest
+            else return Nothing
 
     signatureAlgExtension =
         return $

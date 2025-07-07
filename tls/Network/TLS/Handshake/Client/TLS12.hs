@@ -30,6 +30,8 @@ import Network.TLS.X509 hiding (Certificate)
 import Network.TLS.Util (catchException)
 import Network.TLS.Wire
 
+import System.Timeout (timeout)
+
 ----------------------------------------------------------------
 
 recvServerFirstFlight12 :: ClientParams -> Context -> [Handshake] -> IO ()
@@ -55,16 +57,26 @@ expectCertificate _ ctx p = expectServerKeyExchange ctx p
 
 expectCertificateStatus :: ClientParams -> Context -> Handshake -> IO (RecvState IO)
 expectCertificateStatus cparams ctx (CertificateStatus ocspDer) = do
+    -- Validate OCSP response size to prevent allocation spikes
+    when (B.length ocspDer > 16384) $  -- Max 16KB per RFC recommendation
+        throwCore $ Error_Protocol "OCSP response too large (>16KB)" DecodeError
+    
     -- Get the certificate chain we just processed
     mCerts <- usingState_ ctx getServerCertificateChain
     case mCerts of
         Nothing -> throwCore $ Error_Protocol "no certificate chain available for OCSP validation" InternalError
         Just certs -> do
-            -- Call the client hook for OCSP validation
-            result <- liftIO $ onServerCertificateStatus (clientHooks cparams) certs ocspDer
-            case result of
-                CertificateUsageAccept -> return $ RecvStateHandshake (expectServerKeyExchange ctx)
-                CertificateUsageReject reason -> throwCore $ Error_Certificate (show reason)
+            -- Call the client hook for OCSP validation with timeout
+            mResult <- liftIO $ timeout (clientOCSPTimeoutMicros cparams) $ 
+                onServerCertificateStatus (clientHooks cparams) certs ocspDer
+            case mResult of
+                Just CertificateUsageAccept -> return $ RecvStateHandshake (expectServerKeyExchange ctx)
+                Just (CertificateUsageReject reason) -> throwCore $ Error_Certificate (show reason)
+                Nothing -> do
+                    -- Timeout occurred - check if must-staple enforcement requires failure
+                    if certificateChainRequiresStapling certs && clientEnforceMustStaple cparams
+                        then throwCore $ Error_Protocol "OCSP validation hook timed out for must-staple certificate" CertificateRequired
+                        else return $ RecvStateHandshake (expectServerKeyExchange ctx)  -- Continue without OCSP validation
 expectCertificateStatus cparams ctx p = do
     -- No CertificateStatus received - check if certificate requires stapling
     mCerts <- usingState_ ctx getServerCertificateChain

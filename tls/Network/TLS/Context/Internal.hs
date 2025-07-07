@@ -69,6 +69,7 @@ module Network.TLS.Context.Internal (
     modifyTLS13State,
     CipherChoice (..),
     makeCipherChoice,
+    newRecordLimitRef,
 ) where
 
 import Control.Concurrent.MVar
@@ -137,6 +138,10 @@ data Context
     -- ^ empty packet workaround for CBC guessability.
     , ctxFragmentSize :: Maybe Int
     -- ^ maximum size of plaintext fragments
+    , ctxMyRecordLimit :: IORef RecordLimit
+    -- ^ maximum size of plaintext fragments, val + 1 is used for TLS 1.3
+    , ctxPeerRecordLimit :: IORef RecordLimit
+    -- ^ maximum size of plaintext fragments, val + 1 is used for TLS 1.3
     }
 
 data RoleParams = RoleParams
@@ -214,6 +219,13 @@ getTLS13State Context{..} = readIORef ctxTLS13State
 
 modifyTLS13State :: Context -> (TLS13State -> TLS13State) -> IO ()
 modifyTLS13State Context{..} f = atomicModifyIORef' ctxTLS13State $ \st -> (f st, ())
+
+data RecordLimit
+    = NoRecordLimit -- for QUIC
+    | RecordLimit
+        Int -- effective
+        (Maybe Int) -- pending
+    deriving (Eq, Show)
 
 data HandshakeSync
     = HandshakeSync

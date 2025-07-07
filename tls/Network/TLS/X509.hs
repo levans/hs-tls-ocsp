@@ -123,4 +123,6 @@ hasStatusRequestFeature asn1 = 5 `elem` extractIntegers 10 asn1  -- Max depth of
 certificateChainRequiresStapling :: CertificateChain -> Bool
 certificateChainRequiresStapling cc
     | isNullCertificateChain cc = False
-    | otherwise = hasMustStapleExtension (getCertificate (getCertificateChainLeaf cc))
+    | otherwise = case getCertificateChainLeaf cc of
+        Nothing -> False
+        Just signed -> hasMustStapleExtension (getCertificate signed)

@@ -20,6 +20,12 @@ module Network.TLS.Parameters (
     CertificateUsage (..),
     CertificateRejectReason (..),
     Information (..),
+    Limit (..),
+    defaultLimit,
+    
+    -- * OCSP timeout constants
+    defaultClientOCSPTimeout,
+    defaultServerOCSPTimeout,
 ) where
 
 import qualified Data.ByteString as B
@@ -139,6 +145,22 @@ data ClientParams = ClientParams
     -- If False, connections continue with a warning.
     --
     -- Default: True (RFC 7633 compliant)
+    , clientUseOCSP :: Bool
+    -- ^ Whether to request OCSP stapling from the server.
+    -- If True, sends status_request extension in Client Hello.
+    -- If False, no OCSP stapling is requested.
+    --
+    -- Default: True
+    , clientOCSPTimeoutMicros :: Int
+    -- ^ Timeout in microseconds for client OCSP validation hook.
+    -- 
+    -- Prevents client from hanging if 'onServerCertificateStatus' hook blocks.
+    -- If timeout occurs, OCSP validation is skipped unless must-staple is enforced.
+    -- 
+    -- /Note:/ This timeout is specified in /microseconds/, not milliseconds.
+    -- Use 'defaultClientOCSPTimeout' or multiply seconds by 1,000,000.
+    --
+    -- Default: 'defaultClientOCSPTimeout' (2,000,000 microseconds = 2 seconds)
     }
     deriving (Show)
 
@@ -156,6 +178,8 @@ defaultParamsClient serverName serverId =
         , clientDebug = defaultDebugParams
         , clientUseEarlyData = False
         , clientEnforceMustStaple = True
+        , clientUseOCSP = True
+        , clientOCSPTimeoutMicros = defaultClientOCSPTimeout
         }
 
 data ServerParams = ServerParams
@@ -200,9 +224,16 @@ data ServerParams = ServerParams
     , serverLimit :: Limit
     
     -- | OCSP timeout in microseconds for HTTP/2 connections.
-    -- If OCSP hook takes longer than this, connection continues without OCSP stapling.
+    -- 
+    -- If 'onCertificateStatus' hook takes longer than this timeout, 
+    -- the connection continues without OCSP stapling. This prevents
+    -- blocking the HTTP/2 connection preface. HTTP/1.x connections 
+    -- use blocking calls without timeout.
     --
-    -- Default: 2000000 (2 seconds)
+    -- /Note:/ This timeout is specified in /microseconds/, not milliseconds.
+    -- Use 'defaultServerOCSPTimeout' or multiply seconds by 1,000,000.
+    --
+    -- Default: 'defaultServerOCSPTimeout' (2,000,000 microseconds = 2 seconds)
     , serverOCSPTimeoutMicros :: Int
     
     -- | Whether to enforce must-staple certificate requirement strictly.
@@ -227,7 +258,7 @@ defaultParamsServer =
         , serverEarlyDataSize = 0
         , serverTicketLifetime = 7200
         , serverLimit = defaultLimit
-        , serverOCSPTimeoutMicros = 2000000  -- 2 seconds
+        , serverOCSPTimeoutMicros = defaultServerOCSPTimeout
         , serverEnforceMustStaple = True     -- RFC 7633 compliant
         }
 
@@ -713,3 +744,55 @@ data Information = Information
     , infoIsEarlyDataAccepted :: Bool
     }
     deriving (Show, Eq)
+
+-- | Limitations for security.
+--
+-- @since 2.1.7
+data Limit = Limit
+    { limitRecordSize :: Maybe Int
+    -- ^ Record size limit defined in RFC 8449.
+    --
+    -- If 'Nothing', the "record_size_limit" extension is not used.
+    --
+    -- In the case of 'Just': A client sends the "record_size_limit"
+    -- extension with this value to the server. A server sends back
+    -- this extension with its own value if a client sends the
+    -- extension. When negotiated, both my limit and peer's limit
+    -- are enabled for protected communication.
+    --
+    -- Default: Nothing
+    , limitHandshakeFragment :: Int
+    -- ^ The limit to accept the number of each handshake message.
+    -- For instance, a nasty client may send many fragments of client
+    -- certificate.
+    --
+    -- Default: 32
+    }
+    deriving (Eq, Show)
+
+-- | Default value for 'Limit'.
+defaultLimit :: Limit
+defaultLimit =
+    Limit
+        { limitRecordSize = Nothing
+        , limitHandshakeFragment = 32
+        }
+
+-- | Default OCSP timeout for client-side hooks in microseconds.
+-- 
+-- This is the default timeout applied to 'onServerCertificateStatus' 
+-- client hook to prevent handshake hanging if the hook blocks.
+-- 
+-- Default: 2000000 (2 seconds)
+defaultClientOCSPTimeout :: Int
+defaultClientOCSPTimeout = 2000000
+
+-- | Default OCSP timeout for server-side hooks in microseconds.
+--
+-- This is the default timeout applied to 'onCertificateStatus' 
+-- server hook for HTTP/2 connections to prevent blocking the 
+-- connection preface. HTTP/1.x connections use blocking calls.
+--
+-- Default: 2000000 (2 seconds)  
+defaultServerOCSPTimeout :: Int
+defaultServerOCSPTimeout = 2000000

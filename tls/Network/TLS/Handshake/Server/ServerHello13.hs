@@ -34,6 +34,10 @@ import Network.TLS.Types
 import Network.TLS.Wire (putOpaque24)
 import Network.TLS.X509
 
+-- | Check if client requested OCSP stapling via status_request extension
+hasStatusRequest :: [ExtensionRaw] -> Bool
+hasStatusRequest exts = lookupAndDecode EID_StatusRequest MsgTClientHello exts False (const True :: StatusRequest -> Bool)
+
 -- | Encode OCSP response in CertificateStatus format for TLS 1.3 extensions
 -- In TLS 1.3, OCSP responses in Certificate extensions must use the same format as TLS 1.2 CertificateStatus
 encodeCertificateStatusForExtension :: B.ByteString -> B.ByteString
@@ -72,7 +76,7 @@ sendServerHello13 sparams ctx clientKeyShare (usedCipher, usedHash, rtt0) CH{..}
     extraCreds <-
         usingState_ ctx getClientSNI >>= onServerNameIndication (serverHooks sparams)
     let allCreds =
-            filterCredentials (isCredentialAllowed TLS13 chExtensions) $
+            filterCredentials (isCredentialAllowed TLS13 (makeCredentialPredicate TLS13 chExtensions)) $
                 extraCreds `mappend` sharedCredentials (ctxShared ctx)
     ----------------------------------------------------------------
     established <- ctxEstablished ctx
@@ -252,7 +256,14 @@ sendServerHello13 sparams ctx clientKeyShare (usedCipher, usedHash, rtt0) CH{..}
             then do
                 clientSNI <- liftIO $ usingState_ ctx getClientSNI
                 mOcspResponse <- liftIO $ onCertificateStatus (serverHooks sparams) certChain clientSNI
-                case mOcspResponse of
+                -- Validate OCSP response size to prevent allocation spikes
+                mValidatedOcspResponse <- case mOcspResponse of
+                    Just ocspDer -> 
+                        if B.length ocspDer > 16384  -- Max 16KB per RFC recommendation
+                            then return Nothing  -- TODO: Add proper logging here
+                            else return $ Just ocspDer
+                    Nothing -> return Nothing
+                case mValidatedOcspResponse of
                     Just ocspDer ->
                         -- Add OCSP extension to the leaf certificate only
                         -- For TLS 1.3, we need to wrap the OCSP DER in CertificateStatus format
