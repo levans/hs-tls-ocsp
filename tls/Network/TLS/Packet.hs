@@ -154,6 +154,7 @@ decodeHandshake cp ty = runGetErr ("handshake[" ++ show ty ++ "]") $ case ty of
     HandshakeType_ClientKeyXchg -> decodeClientKeyXchg cp
     HandshakeType_Finished -> decodeFinished
     HandshakeType_NewSessionTicket -> decodeNewSessionTicket
+    HandshakeType_CertificateStatus -> decodeCertificateStatus
     x -> fail $ "Unsupported HandshakeType " ++ show x
 
 decodeHelloRequest :: Get Handshake
@@ -210,6 +211,14 @@ decodeFinished = Finished <$> (remaining >>= getBytes)
 
 decodeNewSessionTicket :: Get Handshake
 decodeNewSessionTicket = NewSessionTicket <$> getWord32 <*> getOpaque16
+
+decodeCertificateStatus :: Get Handshake
+decodeCertificateStatus = do
+    statusType <- getWord8
+    when (statusType /= 1) $ fail "CertificateStatus: unsupported status type (only OCSP supported)"
+    responseLength <- getWord24
+    ocspResponse <- getBytes (fromIntegral responseLength)
+    return $ CertificateStatus ocspResponse
 
 decodeCertRequest :: CurrentParams -> Get Handshake
 decodeCertRequest _cp = do
@@ -302,6 +311,9 @@ decodeServerKeyXchg cp =
         Just cke -> ServerKeyXchg <$> decodeServerKeyXchgAlgorithmData (cParamsVersion cp) cke
         Nothing -> ServerKeyXchg . SKX_Unparsed <$> (remaining >>= getBytes)
 
+----------------------------------------------------------------
+-- encode HANDSHAKE
+
 encodeHandshake :: Handshake -> ByteString
 encodeHandshake o =
     let content = encodeHandshake' o
@@ -357,10 +369,18 @@ encodeHandshake' (CertRequest certTypes sigAlgs certAuthorities) = runPut $ do
             sigAlgs
     putDNames certAuthorities
 encodeHandshake' (CertVerify digitallySigned) = runPut $ putDigitallySigned digitallySigned
+encodeHandshake' (ClientKeyXchg ckx) = runPut $ do
+    case ckx of
+        CKX_RSA encryptedPreMain -> putBytes encryptedPreMain
+        CKX_DH clientDHPublic -> putInteger16 $ dhUnwrapPublic clientDHPublic
+        CKX_ECDH bytes -> putOpaque8 bytes
 encodeHandshake' (Finished opaque) = runPut $ putBytes opaque
 encodeHandshake' (NewSessionTicket life ticket) = runPut $ do
     putWord32 life
     putOpaque16 ticket
+encodeHandshake' (CertificateStatus der) = runPut $ do
+    putWord8 0x01  -- status_type = ocsp
+    putOpaque24 der
 
 ------------------------------------------------------------
 

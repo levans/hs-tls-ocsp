@@ -7,6 +7,7 @@ module Network.TLS.Handshake.Server.ServerHello13 (
 
 import Control.Monad.State.Strict
 import qualified Data.ByteString as B
+import Data.Serialize (runPut, putWord8)
 
 import Network.TLS.Cipher
 import Network.TLS.Context.Internal
@@ -30,7 +31,19 @@ import Network.TLS.State
 import Network.TLS.Struct
 import Network.TLS.Struct13
 import Network.TLS.Types
+import Network.TLS.Wire (putOpaque24)
 import Network.TLS.X509
+
+-- | Check if client requested OCSP stapling via status_request extension
+hasStatusRequest :: [ExtensionRaw] -> Bool
+hasStatusRequest exts = lookupAndDecode EID_StatusRequest MsgTClientHello exts False (const True :: StatusRequest -> Bool)
+
+-- | Encode OCSP response in CertificateStatus format for TLS 1.3 extensions
+-- In TLS 1.3, OCSP responses in Certificate extensions must use the same format as TLS 1.2 CertificateStatus
+encodeCertificateStatusForExtension :: B.ByteString -> B.ByteString
+encodeCertificateStatusForExtension ocspDer = runPut $ do
+    putWord8 0x01      -- status_type = 1 (OCSP)
+    putOpaque24 ocspDer -- length (3 bytes) + OCSP DER data
 
 sendServerHello13
     :: ServerParams
@@ -63,7 +76,7 @@ sendServerHello13 sparams ctx clientKeyShare (usedCipher, usedHash, rtt0) CH{..}
     extraCreds <-
         usingState_ ctx getClientSNI >>= onServerNameIndication (serverHooks sparams)
     let allCreds =
-            filterCredentials (isCredentialAllowed TLS13 chExtensions) $
+            filterCredentials (isCredentialAllowed TLS13 (makeCredentialPredicate TLS13 chExtensions)) $
                 extraCreds `mappend` sharedCredentials (ctxShared ctx)
     ----------------------------------------------------------------
     established <- ctxEstablished ctx
@@ -237,7 +250,36 @@ sendServerHello13 sparams ctx clientKeyShare (usedCipher, usedHash, rtt0) CH{..}
             usingHState ctx $ setCertReqSent True
 
         let CertificateChain cs = certChain
-            ess = replicate (length cs) []
+        -- Build per-certificate extensions, including OCSP response if available
+        -- Also handle must-staple certificate validation
+        ess <- if hasStatusRequest chExtensions && not (null cs)
+            then do
+                clientSNI <- liftIO $ usingState_ ctx getClientSNI
+                mOcspResponse <- liftIO $ onCertificateStatus (serverHooks sparams) certChain clientSNI
+                -- Validate OCSP response size to prevent allocation spikes
+                mValidatedOcspResponse <- case mOcspResponse of
+                    Just ocspDer -> 
+                        if B.length ocspDer > 16384  -- Max 16KB per RFC recommendation
+                            then return Nothing  -- TODO: Add proper logging here
+                            else return $ Just ocspDer
+                    Nothing -> return Nothing
+                case mValidatedOcspResponse of
+                    Just ocspDer ->
+                        -- Add OCSP extension to the leaf certificate only
+                        -- For TLS 1.3, we need to wrap the OCSP DER in CertificateStatus format
+                        let wrappedOcsp = encodeCertificateStatusForExtension ocspDer
+                            ocspExt = ExtensionRaw EID_StatusRequest wrappedOcsp
+                         in return $ [ocspExt] : replicate (length cs - 1) []
+                    Nothing -> do
+                        -- Check if certificate requires OCSP stapling (must-staple)
+                        if certificateChainRequiresStapling certChain && serverEnforceMustStaple sparams
+                            then liftIO $ throwCore $ Error_Protocol "certificate requires OCSP stapling but no OCSP response provided" CertificateRequired
+                            else return $ replicate (length cs) []
+            else do
+                -- Client didn't request OCSP but check if certificate requires it (must-staple)
+                if not (null cs) && certificateChainRequiresStapling certChain && serverEnforceMustStaple sparams
+                    then liftIO $ throwCore $ Error_Protocol "certificate requires OCSP stapling but client did not request it" CertificateRequired
+                    else return $ replicate (length cs) []
         loadPacket13 ctx $ Handshake13 [Certificate13 "" certChain ess]
         liftIO $ usingState_ ctx $ setServerCertificateChain certChain
         hChSc <- transcriptHash ctx

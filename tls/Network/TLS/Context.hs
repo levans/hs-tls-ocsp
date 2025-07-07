@@ -174,6 +174,9 @@ contextNew backend params = liftIO $ do
                 , doPostHandshakeAuthWith_ = doPostHandshakeAuthWith params
                 }
 
+    myrecordlimit <- newRecordLimitRef Nothing
+    peerrecordlimit <- newRecordLimitRef Nothing
+    
     let ctx =
             Context
                 { ctxBackend = getBackend backend
@@ -199,6 +202,8 @@ contextNew backend params = liftIO $ do
                 , ctxHandshakeSync = HandshakeSync syncNoOp syncNoOp
                 , ctxQUICMode = False
                 , ctxTLS13State = st13ref
+                , ctxMyRecordLimit = myrecordlimit
+                , ctxPeerRecordLimit = peerrecordlimit
                 }
 
         syncNoOp _ _ = return ()

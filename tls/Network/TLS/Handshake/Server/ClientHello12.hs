@@ -80,7 +80,7 @@ credsTriple sparams ctx CH{..} extraCreds
     commonCiphers creds sigCreds = filter ((`elem` chCiphers) . cipherID) (getCiphers sparams creds sigCreds)
 
     allCreds =
-        filterCredentials (isCredentialAllowed TLS12 chExtensions) $
+        filterCredentials (isCredentialAllowed TLS12 (makeCredentialPredicate TLS12 chExtensions)) $
             extraCreds `mappend` sharedCredentials (ctxShared ctx)
 
     -- When selecting a cipher we must ensure that it is allowed for the

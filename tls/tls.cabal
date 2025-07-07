@@ -36,6 +36,8 @@ library
         Network.TLS.Extra.Cipher
         Network.TLS.Extra.FFDHE
         Network.TLS.QUIC
+        Network.TLS.Extension
+        Network.TLS.X509
 
     other-modules:
         Network.TLS.Struct
@@ -50,7 +52,6 @@ library
         Network.TLS.Crypto.IES
         Network.TLS.Crypto.Types
         Network.TLS.ErrT
-        Network.TLS.Extension
         Network.TLS.Handshake
         Network.TLS.Handshake.Certificate
         Network.TLS.Handshake.Client
@@ -105,7 +106,6 @@ library
         Network.TLS.Util.Serialization
         Network.TLS.Types
         Network.TLS.Wire
-        Network.TLS.X509
 
     default-extensions: Strict StrictData
     default-language: Haskell2010
@@ -142,6 +142,8 @@ test-suite spec
         CiphersSpec
         EncodeSpec
         HandshakeSpec
+        MustStapleSpec
+        OCSPExtensionSpec
         PipeChan
         PubKey
         Run

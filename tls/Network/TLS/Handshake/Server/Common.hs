@@ -8,6 +8,7 @@ module Network.TLS.Handshake.Server.Common (
     filterCredentials,
     filterCredentialsWithHashSignatures,
     isCredentialAllowed,
+    makeCredentialPredicate,
     storePrivInfoServer,
 ) where
 
@@ -41,29 +42,35 @@ checkValidClientCertChain ctx errmsg = do
             | otherwise -> return cc
 
 credentialDigitalSignatureKey :: Credential -> Maybe PubKey
-credentialDigitalSignatureKey cred
-    | isDigitalSignaturePair keys = Just pubkey
-    | otherwise = Nothing
-  where
-    keys@(pubkey, _) = credentialPublicPrivateKeys cred
+credentialDigitalSignatureKey cred =
+    case credentialPublicPrivateKeys cred of
+        Nothing -> Nothing  -- empty certificate chain
+        Just keys@(pubkey, _)
+            | isDigitalSignaturePair keys -> Just pubkey
+            | otherwise -> Nothing
 
 filterCredentials :: (Credential -> Bool) -> Credentials -> Credentials
 filterCredentials p (Credentials l) = Credentials (filter p l)
 
-isCredentialAllowed :: Version -> [ExtensionRaw] -> Credential -> Bool
-isCredentialAllowed ver exts cred =
-    pubkey `versionCompatible` ver && satisfiesEcPredicate p pubkey
-  where
-    (pubkey, _) = credentialPublicPrivateKeys cred
-    -- ECDSA keys are tested against supported elliptic curves until TLS12 but
-    -- not after.  With TLS13, the curve is linked to the signature algorithm
-    -- and client support is tested with signatureCompatible13.
-    p
-        | ver < TLS13 = case extensionLookup EID_SupportedGroups exts
-            >>= extensionDecode MsgTClientHello of
-            Nothing -> const True
-            Just (SupportedGroups sg) -> (`elem` sg)
-        | otherwise = const True
+-- ECDSA keys are tested against supported elliptic curves until TLS12 but
+-- not after.  With TLS13, the curve is linked to the signature algorithm
+-- and client support is tested with signatureCompatible13.
+makeCredentialPredicate :: Version -> [ExtensionRaw] -> (Group -> Bool)
+makeCredentialPredicate ver exts
+    | ver >= TLS13 = const True
+    | otherwise =
+        lookupAndDecode
+            EID_SupportedGroups
+            MsgTClientHello
+            exts
+            (const True)
+            (\(SupportedGroups sg) -> (`elem` sg))
+
+isCredentialAllowed :: Version -> (Group -> Bool) -> Credential -> Bool
+isCredentialAllowed ver p cred =
+    case credentialPublicPrivateKeys cred of
+        Nothing -> False  -- empty certificate chain not allowed
+        Just (pubkey, _) -> pubkey `versionCompatible` ver && satisfiesEcPredicate p pubkey
 
 -- Filters a list of candidate credentials with credentialMatchesHashSignatures.
 --

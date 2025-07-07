@@ -111,38 +111,43 @@ credentialsFindForDecrypting (Credentials l) = find forEncrypting l
 -- this change in future.
 credentialCanDecrypt :: Credential -> Maybe ()
 credentialCanDecrypt (chain, priv) =
-    case (pub, priv) of
-        (PubKeyRSA _, PrivKeyRSA _) ->
-            case extensionGet (certExtensions cert) of
-                Nothing -> Just ()
-                Just (ExtKeyUsage flags)
-                    | KeyUsage_keyEncipherment `elem` flags -> Just ()
-                    | otherwise -> Nothing
-        _ -> Nothing
-  where
-    cert = getCertificate signed
-    pub = certPubKey cert
-    signed = getCertificateChainLeaf chain
+    case getCertificateChainLeaf chain of
+        Nothing -> Nothing  -- empty chain cannot decrypt
+        Just signed ->
+            case (pub, priv) of
+                (PubKeyRSA _, PrivKeyRSA _) ->
+                    case extensionGet (certExtensions cert) of
+                        Nothing -> Just ()
+                        Just (ExtKeyUsage flags)
+                            | KeyUsage_keyEncipherment `elem` flags -> Just ()
+                            | otherwise -> Nothing
+                _ -> Nothing
+          where
+            cert = getCertificate signed
+            pub = certPubKey cert
 
 credentialCanSign :: Credential -> Maybe KeyExchangeSignatureAlg
 credentialCanSign (chain, priv) =
-    case extensionGet (certExtensions cert) of
-        Nothing -> findKeyExchangeSignatureAlg (pub, priv)
-        Just (ExtKeyUsage flags)
-            | KeyUsage_digitalSignature `elem` flags ->
-                findKeyExchangeSignatureAlg (pub, priv)
-            | otherwise -> Nothing
-  where
-    cert = getCertificate signed
-    pub = certPubKey cert
-    signed = getCertificateChainLeaf chain
+    case getCertificateChainLeaf chain of
+        Nothing -> Nothing  -- empty chain cannot sign
+        Just signed ->
+            case extensionGet (certExtensions cert) of
+                Nothing -> findKeyExchangeSignatureAlg (pub, priv)
+                Just (ExtKeyUsage flags)
+                    | KeyUsage_digitalSignature `elem` flags ->
+                        findKeyExchangeSignatureAlg (pub, priv)
+                    | otherwise -> Nothing
+          where
+            cert = getCertificate signed
+            pub = certPubKey cert
 
-credentialPublicPrivateKeys :: Credential -> (PubKey, PrivKey)
-credentialPublicPrivateKeys (chain, priv) = pub `seq` (pub, priv)
-  where
-    cert = getCertificate signed
-    pub = certPubKey cert
-    signed = getCertificateChainLeaf chain
+credentialPublicPrivateKeys :: Credential -> Maybe (PubKey, PrivKey)
+credentialPublicPrivateKeys (chain, priv) = 
+    case getCertificateChainLeaf chain of
+        Just signed -> let cert = getCertificate signed
+                           pub = certPubKey cert
+                       in Just (pub `seq` (pub, priv))
+        Nothing -> Nothing  -- empty certificate chain
 
 getHashSignature :: SignedCertificate -> Maybe TLS.HashAndSignatureAlgorithm
 getHashSignature signed =

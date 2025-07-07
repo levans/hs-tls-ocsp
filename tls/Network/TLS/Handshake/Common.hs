@@ -22,6 +22,8 @@ module Network.TLS.Handshake.Common (
     ensureRecvComplete,
     processExtendedMainSecret,
     extensionLookup,
+    lookupAndDecode,
+    lookupAndDecodeAndDo,
     getSessionData,
     storePrivInfo,
     isSupportedGroup,
@@ -321,3 +323,31 @@ ticketOrSessionID12 (Just ticket) _
     | ticket /= "" = Just $ B.copy ticket
 ticketOrSessionID12 _ (Session (Just sessionId)) = Just $ B.copy sessionId
 ticketOrSessionID12 _ _ = Nothing
+
+lookupAndDecode
+    :: Extension e
+    => ExtensionID
+    -> MessageType
+    -> [ExtensionRaw]
+    -> a
+    -> (e -> a)
+    -> a
+lookupAndDecode eid msgtyp exts defval conv = case extensionLookup eid exts of
+    Nothing -> defval
+    Just bs -> case extensionDecode msgtyp bs of
+        Nothing -> error $ "Illegal " ++ show eid
+        Just val -> conv val
+
+lookupAndDecodeAndDo
+    :: Extension a
+    => ExtensionID
+    -> MessageType
+    -> [ExtensionRaw]
+    -> IO b
+    -> (a -> IO b)
+    -> IO b
+lookupAndDecodeAndDo eid msgtyp exts defAction action = case extensionLookup eid exts of
+    Nothing -> defAction
+    Just bs -> case extensionDecode msgtyp bs of
+        Nothing -> error $ "Illegal " ++ show eid
+        Just val -> action val

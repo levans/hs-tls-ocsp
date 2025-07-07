@@ -14,6 +14,7 @@ module Network.TLS.Extension (
     SecureRenegotiation (..),
     ApplicationLayerProtocolNegotiation (..),
     ExtendedMainSecret (..),
+    StatusRequest (..),
     SupportedGroups (..),
     Group (..),
     EcPointFormatsSupported (..),
@@ -109,6 +110,7 @@ definedExtensions =
 supportedExtensions :: [ExtensionID]
 supportedExtensions =
     [ EID_ServerName
+    , EID_StatusRequest
     , EID_MaxFragmentLength
     , EID_ApplicationLayerProtocolNegotiation
     , EID_ExtendedMainSecret
@@ -165,7 +167,7 @@ instance Extension ServerName where
     extensionDecode MsgTClientHello = decodeServerName
     extensionDecode MsgTServerHello = decodeServerName
     extensionDecode MsgTEncryptedExtensions = decodeServerName
-    extensionDecode _ = error "extensionDecode: ServerName"
+    extensionDecode _ = const Nothing
 
 decodeServerName :: ByteString -> Maybe ServerName
 decodeServerName = runGetMaybe $ do
@@ -215,7 +217,7 @@ instance Extension MaxFragmentLength where
     extensionDecode MsgTClientHello = decodeMaxFragmentLength
     extensionDecode MsgTServerHello = decodeMaxFragmentLength
     extensionDecode MsgTEncryptedExtensions = decodeMaxFragmentLength
-    extensionDecode _ = error "extensionDecode: MaxFragmentLength"
+    extensionDecode _ = const Nothing
 
 decodeMaxFragmentLength :: ByteString -> Maybe MaxFragmentLength
 decodeMaxFragmentLength = runGetMaybe $ toMaxFragmentEnum <$> getWord8
@@ -283,6 +285,34 @@ instance Extension ExtendedMainSecret where
     extensionDecode MsgTClientHello _ = Just ExtendedMainSecret
     extensionDecode MsgTServerHello _ = Just ExtendedMainSecret
     extensionDecode _ _ = error "extensionDecode: ExtendedMainSecret"
+
+------------------------------------------------------------
+
+-- | Status request extension for OCSP stapling (RFC 6066 Section 8)
+data StatusRequest = StatusRequest
+    deriving (Show, Eq)
+
+instance Extension StatusRequest where
+    extensionID _ = EID_StatusRequest
+    extensionEncode StatusRequest = runPut $ do
+        putWord8 1      -- status_type = ocsp
+        putWord16 0     -- responder_id_list length (empty)
+        putWord16 0     -- request_extensions length (empty)
+    extensionDecode MsgTClientHello = decodeStatusRequest
+    extensionDecode MsgTServerHello = decodeStatusRequest
+    extensionDecode _ = const Nothing
+
+decodeStatusRequest :: ByteString -> Maybe StatusRequest
+decodeStatusRequest = runGetMaybe $ do
+    statusType <- getWord8
+    when (statusType /= 1) $ fail "StatusRequest: unsupported status type (only OCSP supported)"
+    responderIdLen <- getWord16
+    _ <- getBytes (fromIntegral responderIdLen)  -- skip responder ID list  
+    requestExtLen <- getWord16
+    _ <- getBytes (fromIntegral requestExtLen)   -- skip request extensions
+    leftoverLen <- remaining
+    when (leftoverLen /= 0) $ fail "StatusRequest: invalid extension length"
+    return StatusRequest
 
 ------------------------------------------------------------
 

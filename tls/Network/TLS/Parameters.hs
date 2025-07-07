@@ -20,6 +20,12 @@ module Network.TLS.Parameters (
     CertificateUsage (..),
     CertificateRejectReason (..),
     Information (..),
+    Limit (..),
+    defaultLimit,
+    
+    -- * OCSP timeout constants
+    defaultClientOCSPTimeout,
+    defaultServerOCSPTimeout,
 ) where
 
 import qualified Data.ByteString as B
@@ -133,6 +139,28 @@ data ClientParams = ClientParams
     -- is automatically re-sent.
     --
     -- Default: 'False'
+    , clientEnforceMustStaple :: Bool
+    -- ^ Whether to enforce must-staple certificate requirement strictly.
+    -- If True, connections fail when must-staple certificates can't provide OCSP stapling.
+    -- If False, connections continue with a warning.
+    --
+    -- Default: True (RFC 7633 compliant)
+    , clientUseOCSP :: Bool
+    -- ^ Whether to request OCSP stapling from the server.
+    -- If True, sends status_request extension in Client Hello.
+    -- If False, no OCSP stapling is requested.
+    --
+    -- Default: True
+    , clientOCSPTimeoutMicros :: Int
+    -- ^ Timeout in microseconds for client OCSP validation hook.
+    -- 
+    -- Prevents client from hanging if 'onServerCertificateStatus' hook blocks.
+    -- If timeout occurs, OCSP validation is skipped unless must-staple is enforced.
+    -- 
+    -- /Note:/ This timeout is specified in /microseconds/, not milliseconds.
+    -- Use 'defaultClientOCSPTimeout' or multiply seconds by 1,000,000.
+    --
+    -- Default: 'defaultClientOCSPTimeout' (2,000,000 microseconds = 2 seconds)
     }
     deriving (Show)
 
@@ -149,6 +177,9 @@ defaultParamsClient serverName serverId =
         , clientSupported = def
         , clientDebug = defaultDebugParams
         , clientUseEarlyData = False
+        , clientEnforceMustStaple = True
+        , clientUseOCSP = True
+        , clientOCSPTimeoutMicros = defaultClientOCSPTimeout
         }
 
 data ServerParams = ServerParams
@@ -190,6 +221,27 @@ data ServerParams = ServerParams
     -- Acceptable value range is 0 to 604800 (7 days).
     --
     -- Default: 7200 (2 hours)
+    , serverLimit :: Limit
+    
+    -- | OCSP timeout in microseconds for HTTP/2 connections.
+    -- 
+    -- If 'onCertificateStatus' hook takes longer than this timeout, 
+    -- the connection continues without OCSP stapling. This prevents
+    -- blocking the HTTP/2 connection preface. HTTP/1.x connections 
+    -- use blocking calls without timeout.
+    --
+    -- /Note:/ This timeout is specified in /microseconds/, not milliseconds.
+    -- Use 'defaultServerOCSPTimeout' or multiply seconds by 1,000,000.
+    --
+    -- Default: 'defaultServerOCSPTimeout' (2,000,000 microseconds = 2 seconds)
+    , serverOCSPTimeoutMicros :: Int
+    
+    -- | Whether to enforce must-staple certificate requirement strictly.
+    -- If True, connections fail when must-staple certificates can't provide OCSP stapling.
+    -- If False, connections continue with a warning.
+    --
+    -- Default: True (RFC 7633 compliant)
+    , serverEnforceMustStaple :: Bool
     }
     deriving (Show)
 
@@ -205,6 +257,9 @@ defaultParamsServer =
         , serverDebug = defaultDebugParams
         , serverEarlyDataSize = 0
         , serverTicketLifetime = 7200
+        , serverLimit = defaultLimit
+        , serverOCSPTimeoutMicros = defaultServerOCSPTimeout
+        , serverEnforceMustStaple = True     -- RFC 7633 compliant
         }
 
 instance Default ServerParams where
@@ -550,6 +605,16 @@ data ClientHooks = ClientHooks
     --   See RFC 7919 section 3.1 for recommandations.
     , onServerFinished :: Information -> IO ()
     -- ^ When a handshake is done, this hook can check `Information`.
+    , onServerCertificateStatus :: CertificateChain -> ByteString -> IO CertificateUsage
+    -- ^ Called when the server provides an OCSP response for certificate stapling.
+    -- The first parameter is the server's certificate chain being validated.
+    -- The second parameter is the DER-encoded OCSP response from the server.
+    -- Return 'CertificateUsageAccept' to accept the certificate, or
+    -- 'CertificateUsageReject' with a reason to reject it.
+    -- This allows the client to validate the OCSP response and enforce
+    -- certificate revocation policies.
+    --
+    -- Default: 'return CertificateUsageAccept' (accept any OCSP response)
     }
 
 defaultClientHooks :: ClientHooks
@@ -560,6 +625,7 @@ defaultClientHooks =
         , onSuggestALPN = return Nothing
         , onCustomFFDHEGroup = defaultGroupUsage 1024
         , onServerFinished = \_ -> return ()
+        , onServerCertificateStatus = \_ _ -> return CertificateUsageAccept
         }
 
 instance Show ClientHooks where
@@ -629,6 +695,15 @@ data ServerHooks = ServerHooks
     --  of TLS 1.3.
     --
     -- Default: 'return'
+    , onCertificateStatus :: CertificateChain -> Maybe HostName -> IO (Maybe ByteString)
+    -- ^ Called when the server needs to provide an OCSP response for certificate stapling.
+    -- The first parameter is the certificate chain being used for this connection.
+    -- The second parameter is the server name indication (SNI) from the client, if any.
+    -- Return 'Nothing' to disable stapling, or 'Just' a DER-encoded OCSP response.
+    -- This is called after certificate selection and should provide a response
+    -- corresponding to the certificate being used.
+    --
+    -- Default: '\_ _ -> return Nothing' (no OCSP stapling)
     }
 
 defaultServerHooks :: ServerHooks
@@ -639,11 +714,14 @@ defaultServerHooks =
                 CertificateUsageReject $
                     CertificateRejectOther "no client certificates expected"
         , onUnverifiedClientCert = return False
-        , onCipherChoosing = \_ -> head
+        , onCipherChoosing = \_ ccs -> case ccs of
+            [] -> error "onCipherChoosing: no compatible ciphers - configuration error"  
+            c : _ -> c
         , onServerNameIndication = \_ -> return mempty
         , onNewHandshake = \_ -> return True
         , onALPNClientSuggest = Nothing
         , onEncryptedExtensionsCreating = return
+        , onCertificateStatus = \_ _ -> return Nothing
         }
 
 instance Show ServerHooks where
@@ -666,3 +744,55 @@ data Information = Information
     , infoIsEarlyDataAccepted :: Bool
     }
     deriving (Show, Eq)
+
+-- | Limitations for security.
+--
+-- @since 2.1.7
+data Limit = Limit
+    { limitRecordSize :: Maybe Int
+    -- ^ Record size limit defined in RFC 8449.
+    --
+    -- If 'Nothing', the "record_size_limit" extension is not used.
+    --
+    -- In the case of 'Just': A client sends the "record_size_limit"
+    -- extension with this value to the server. A server sends back
+    -- this extension with its own value if a client sends the
+    -- extension. When negotiated, both my limit and peer's limit
+    -- are enabled for protected communication.
+    --
+    -- Default: Nothing
+    , limitHandshakeFragment :: Int
+    -- ^ The limit to accept the number of each handshake message.
+    -- For instance, a nasty client may send many fragments of client
+    -- certificate.
+    --
+    -- Default: 32
+    }
+    deriving (Eq, Show)
+
+-- | Default value for 'Limit'.
+defaultLimit :: Limit
+defaultLimit =
+    Limit
+        { limitRecordSize = Nothing
+        , limitHandshakeFragment = 32
+        }
+
+-- | Default OCSP timeout for client-side hooks in microseconds.
+-- 
+-- This is the default timeout applied to 'onServerCertificateStatus' 
+-- client hook to prevent handshake hanging if the hook blocks.
+-- 
+-- Default: 2000000 (2 seconds)
+defaultClientOCSPTimeout :: Int
+defaultClientOCSPTimeout = 2000000
+
+-- | Default OCSP timeout for server-side hooks in microseconds.
+--
+-- This is the default timeout applied to 'onCertificateStatus' 
+-- server hook for HTTP/2 connections to prevent blocking the 
+-- connection preface. HTTP/1.x connections use blocking calls.
+--
+-- Default: 2000000 (2 seconds)  
+defaultServerOCSPTimeout :: Int
+defaultServerOCSPTimeout = 2000000

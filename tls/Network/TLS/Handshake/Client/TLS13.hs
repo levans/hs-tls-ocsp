@@ -34,6 +34,18 @@ import Network.TLS.Struct
 import Network.TLS.Struct13
 import Network.TLS.Types
 import Network.TLS.X509
+import Network.TLS.Wire
+
+import System.Timeout (timeout)
+
+-- | Decode OCSP response from TLS 1.3 certificate extension format
+-- The extension contains CertificateStatus format: status_type (1 byte) + length (3 bytes) + OCSP DER
+decodeCertificateStatusFromExtension :: B.ByteString -> Maybe B.ByteString
+decodeCertificateStatusFromExtension = runGetMaybe $ do
+    statusType <- getWord8
+    when (statusType /= 1) $ fail "CertificateStatus extension: unsupported status type (only OCSP supported)"
+    responseLength <- getWord24
+    getBytes (fromIntegral responseLength)
 
 ----------------------------------------------------------------
 ----------------------------------------------------------------
@@ -205,10 +217,52 @@ processCertRequest13 ctx token exts = do
 -- not used in 0-RTT
 expectCertAndVerify
     :: MonadIO m => ClientParams -> Context -> Handshake13 -> RecvHandshake13M m ()
-expectCertAndVerify cparams ctx (Certificate13 _ cc _) = do
+expectCertAndVerify cparams ctx (Certificate13 _ cc certExts) = do
     liftIO $ usingState_ ctx $ setServerCertificateChain cc
     liftIO $ doCertificate cparams ctx cc
-    let pubkey = certPubKey $ getCertificate $ getCertificateChainLeaf cc
+    pubkey <- case getCertificateChainLeaf cc of
+        Just leafCert -> return $ certPubKey $ getCertificate leafCert
+        Nothing -> throwCore $ Error_Protocol "empty certificate chain" CertificateUnknown
+    
+    -- Process OCSP response from leaf certificate extensions (TLS 1.3)
+    case certExts of
+        (leafExts : _) -> do
+            -- Check if client requested OCSP stapling
+            sentStatusRequest <- usingHState ctx getClientSentStatusRequest
+            when sentStatusRequest $ do
+                -- Look for OCSP response in leaf certificate extensions
+                case extensionLookup EID_StatusRequest leafExts of
+                    Just wrappedOcspDer -> do
+                        -- Decode the wrapped OCSP response (TLS 1.3 format)
+                        case decodeCertificateStatusFromExtension wrappedOcspDer of
+                            Just ocspDer -> do
+                                -- Validate OCSP response size to prevent allocation spikes
+                                when (B.length ocspDer > 16384) $  -- Max 16KB per RFC recommendation
+                                    throwCore $ Error_Protocol "OCSP response too large (>16KB) in TLS 1.3" DecodeError
+                                
+                                -- Call client OCSP validation hook with timeout
+                                mResult <- liftIO $ timeout (clientOCSPTimeoutMicros cparams) $ 
+                                    onServerCertificateStatus (clientHooks cparams) cc ocspDer
+                                case mResult of
+                                    Just CertificateUsageAccept -> return ()
+                                    Just (CertificateUsageReject reason) -> throwCore $ Error_Certificate (show reason)
+                                    Nothing -> do
+                                        -- Timeout occurred - check if must-staple enforcement requires failure
+                                        if certificateChainRequiresStapling cc && clientEnforceMustStaple cparams
+                                            then throwCore $ Error_Protocol "OCSP validation hook timed out for must-staple certificate in TLS 1.3" CertificateRequired
+                                            else return ()  -- Continue without OCSP validation
+                            Nothing -> 
+                                throwCore $ Error_Protocol "invalid OCSP response format in TLS 1.3 certificate extension" DecodeError
+                    Nothing -> do
+                        -- No OCSP response but check if certificate requires stapling (must-staple)
+                        when (certificateChainRequiresStapling cc && clientEnforceMustStaple cparams) $
+                            throwCore $ Error_Protocol "certificate requires OCSP stapling but no response received in TLS 1.3" CertificateRequired
+        [] -> do
+            -- No certificate extensions, check must-staple requirement
+            sentStatusRequest <- usingHState ctx getClientSentStatusRequest
+            when (sentStatusRequest && certificateChainRequiresStapling cc && clientEnforceMustStaple cparams) $
+                throwCore $ Error_Protocol "certificate requires OCSP stapling but no certificate extensions provided" CertificateRequired
+    
     ver <- liftIO $ usingState_ ctx getVersion
     checkDigitalSignatureKey ver pubkey
     usingHState ctx $ setPublicKey pubkey

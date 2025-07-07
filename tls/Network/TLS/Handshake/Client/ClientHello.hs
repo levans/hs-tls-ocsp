@@ -98,7 +98,10 @@ sendClientHello' cparams ctx groups crand (pskInfo, rtt0info, rtt0) = do
         Just info -> Just <$> getEarlySecretInfo info
     unless hrr $ contextSync ctx $ SendClientHello mEarlySecInfo
     let sentExtensions = map (\(ExtensionRaw i _) -> i) extensions
+        sentStatusRequest = EID_StatusRequest `elem` sentExtensions
     modifyTLS13State ctx $ \st -> st{tls13stSentExtensions = sentExtensions}
+    -- Track if StatusRequest was sent for TLS 1.2 OCSP handling
+    usingHState ctx $ setClientSentStatusRequest sentStatusRequest
   where
     ciphers = supportedCiphers $ ctxSupported ctx
     compressions = supportedCompressions $ ctxSupported ctx
@@ -124,6 +127,7 @@ sendClientHello' cparams ctx groups crand (pskInfo, rtt0info, rtt0) = do
             , groupExtension
             , ecPointExtension
             , sessionTicketExtension
+            , statusRequestExtension
             , signatureAlgExtension
             , -- , heartbeatExtension
               versionExtension
@@ -182,6 +186,11 @@ sendClientHello' cparams ctx groups crand (pskInfo, rtt0info, rtt0) = do
             (sidOrTkt, _) : _
                 | isTicket sidOrTkt -> return $ Just $ toExtensionRaw $ SessionTicket sidOrTkt
             _ -> return $ Just $ toExtensionRaw $ SessionTicket ""
+
+    statusRequestExtension =
+        if clientUseOCSP cparams
+            then return $ Just $ toExtensionRaw StatusRequest
+            else return Nothing
 
     signatureAlgExtension =
         return $

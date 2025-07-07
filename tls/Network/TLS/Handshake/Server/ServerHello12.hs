@@ -5,6 +5,7 @@ module Network.TLS.Handshake.Server.ServerHello12 (
     sendServerHello12,
 ) where
 
+import qualified Data.ByteString as B
 import Network.TLS.Cipher
 import Network.TLS.Compression
 import Network.TLS.Context.Internal
@@ -26,6 +27,16 @@ import Network.TLS.State
 import Network.TLS.Struct
 import Network.TLS.Types
 import Network.TLS.X509 hiding (Certificate)
+
+import System.Timeout (timeout)
+
+-- | Check if client requested OCSP stapling via status_request extension
+hasStatusRequest :: [ExtensionRaw] -> Bool
+hasStatusRequest exts = lookupAndDecode EID_StatusRequest MsgTClientHello exts False (const True :: StatusRequest -> Bool)
+
+-- | Helper function to convert Extension to ExtensionRaw
+toExtensionRaw :: Extension e => e -> ExtensionRaw
+toExtensionRaw ext = ExtensionRaw (extensionID ext) (extensionEncode ext)
 
 sendServerHello12
     :: ServerParams
@@ -113,7 +124,53 @@ sendServerFirstFlight sparams ctx usedCipher mcred chExts = do
     let b1 = b0 . (Certificate cc :)
     usingState_ ctx $ setServerCertificateChain cc
 
-    -- send server key exchange if needed
+    -- Send OCSP CertificateStatus immediately after Certificate (RFC 6066)
+    -- Also handle must-staple certificate validation
+    b2 <- if hasStatusRequest chExts && not (isNullCertificateChain cc)
+        then do
+            clientSNI <- usingState_ ctx getClientSNI
+            
+            -- Check if HTTP/2 was negotiated via ALPN - if so, use non-blocking OCSP
+            alpnProto <- usingState_ ctx getNegotiatedProtocol
+            let isHTTP2 = alpnProto == Just "h2"
+            
+            mOcspResponse <- if isHTTP2
+                then do
+                    -- For HTTP/2, call OCSP hook with configurable timeout to prevent handshake hanging
+                    result <- timeout (serverOCSPTimeoutMicros sparams) $ onCertificateStatus (serverHooks sparams) cc clientSNI
+                    case result of
+                        Just ocspResp -> return ocspResp
+                        Nothing -> return Nothing  -- Timeout - don't provide OCSP response
+                else 
+                    -- For HTTP/1.1, use normal blocking call
+                    onCertificateStatus (serverHooks sparams) cc clientSNI
+            
+            -- Validate OCSP response size to prevent allocation spikes
+            mValidatedOcspResponse <- case mOcspResponse of
+                Just ocspDer -> 
+                    if B.length ocspDer > 16384  -- Max 16KB per RFC recommendation
+                        then do
+                            -- Log oversized response and reject it
+                            return Nothing  -- TODO: Add proper logging here
+                        else return $ Just ocspDer
+                Nothing -> return Nothing
+                    
+            case mValidatedOcspResponse of
+                Just ocspDer -> return $ b1 . (CertificateStatus ocspDer :)
+                Nothing -> do
+                    -- Check if certificate requires OCSP stapling (must-staple)
+                    if certificateChainRequiresStapling cc && serverEnforceMustStaple sparams
+                        then if isHTTP2
+                            then throwCore $ Error_Protocol "certificate requires OCSP stapling but OCSP hook timed out (HTTP/2)" CertificateRequired
+                            else throwCore $ Error_Protocol "certificate requires OCSP stapling but no OCSP response provided" CertificateRequired
+                        else return b1
+        else do
+            -- Client didn't request OCSP but check if certificate requires it (must-staple)
+            if not (isNullCertificateChain cc) && certificateChainRequiresStapling cc && serverEnforceMustStaple sparams
+                then throwCore $ Error_Protocol "certificate requires OCSP stapling but client did not request it" CertificateRequired
+                else return b1
+
+    -- send server key exchange if needed (after Certificate and CertificateStatus)
     skx <- case cipherKeyExchange usedCipher of
         CipherKeyExchange_DH_Anon -> Just <$> generateSKX_DH_Anon
         CipherKeyExchange_DHE_RSA -> Just <$> generateSKX_DHE KX_RSA
@@ -121,10 +178,9 @@ sendServerFirstFlight sparams ctx usedCipher mcred chExts = do
         CipherKeyExchange_ECDHE_RSA -> Just <$> generateSKX_ECDHE KX_RSA
         CipherKeyExchange_ECDHE_ECDSA -> Just <$> generateSKX_ECDHE KX_ECDSA
         _ -> return Nothing
-    let b2 = case skx of
-            Nothing -> b1
-            Just kx -> b1 . (ServerKeyXchg kx :)
-
+    let b3 = case skx of
+            Nothing -> b2
+            Just kx -> b2 . (ServerKeyXchg kx :)
     -- FIXME we don't do this on a Anonymous server
 
     -- When configured, send a certificate request with the DNs of all
@@ -143,8 +199,8 @@ sendServerFirstFlight sparams ctx usedCipher mcred chExts = do
                         hashSigs
                         (map extractCAname $ serverCACertificates sparams)
             usingHState ctx $ setCertReqSent True
-            return $ b2 . (creq :)
-        else return b2
+            return $ b3 . (creq :)
+        else return b3
   where
     setup_DHE = do
         let possibleFFGroups = negotiatedGroupsInCommon ctx chExts `intersect` availableFFGroups
@@ -270,18 +326,44 @@ makeServerHello sparams ctx usedCipher mcred chExts session = do
                     Just _ -> return [ExtensionRaw EID_ServerName ""]
                     Nothing -> return []
     let useTicket = sessionUseTicket $ sharedSessionManager $ serverShared sparams
-        ticktExt
-            | not resuming && useTicket =
-                let raw = extensionEncode $ SessionTicket ""
-                 in [ExtensionRaw EID_SessionTicket raw]
-            | otherwise = []
+        sessionTicketExt
+            | not resuming && useTicket = Just $ toExtensionRaw $ SessionTicket ""
+            | otherwise = Nothing
+
+    -- in TLS12, we need to check as well the certificates we are sending if they have in the extension
+    -- the necessary bits set.
+    secReneg <- usingState_ ctx getSecureRenegotiation
+    secureRenegExt <-
+        if secReneg
+            then do
+                vd <- usingState_ ctx $ do
+                    cvd <- getVerifyData ClientRole
+                    svd <- getVerifyData ServerRole
+                    return $ SecureRenegotiation cvd svd
+                return $ Just $ toExtensionRaw vd
+            else return Nothing
+
+    let recodeSizeLimitExt = Nothing  -- TODO: Implement record size limit processing
+        ecPointExt = Nothing  -- TODO: Implement EC point format if needed
+        alpnExt = Nothing     -- TODO: Implement ALPN if needed
+
+    let statusReqExt =
+            if hasStatusRequest chExts
+                then Just $ ExtensionRaw EID_StatusRequest ""   -- empty payload as per RFC 6066
+                else Nothing
+
     let shExts =
             sharedHelloExtensions (serverShared sparams)
-                ++ secRengExt
-                ++ emsExt
-                ++ protoExt
-                ++ sniExt
-                ++ ticktExt
+                ++ catMaybes
+                    [ {- 0x00 -} listToMaybe sniExt
+                    , {- 0x05 -} statusReqExt
+                    , {- 0x0b -} ecPointExt
+                    , {- 0x10 -} alpnExt
+                    , {- 0x17 -} listToMaybe emsExt
+                    , {- 0x1c -} recodeSizeLimitExt
+                    , {- 0x23 -} sessionTicketExt
+                    , {- 0xff01 -} secureRenegExt
+                    ]
     usingState_ ctx $ setVersion TLS12
     usingHState ctx $
         setServerHelloParameters TLS12 srand usedCipher nullCompression

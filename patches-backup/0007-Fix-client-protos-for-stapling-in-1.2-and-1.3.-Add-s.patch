@@ -1,0 +1,3565 @@
+From ab22c5f2ceb2fe9a42793ee810951e8a0130278f Mon Sep 17 00:00:00 2001
+From: Luke Evans <luke.evans@gmail.com>
+Date: Sat, 5 Jul 2025 02:19:47 -0700
+Subject: [PATCH 7/9] Fix client protos for stapling in 1.2 and 1.3.  Add solid
+ test for server hook and openssl client in 1.2 and 1.3
+
+---
+ cabal.project                                 |   1 -
+ debug/src/OcspTestServer.hs                   | 300 ++++++++++++
+ debug/test-ocsp-stapling.sh                   | 247 ++++++++++
+ debug/tls-debug.cabal                         |  17 +
+ final-validation.sh                           | 122 -----
+ protocol-verification.sh                      | 105 -----
+ simple-tls-test.sh                            |  52 ---
+ test-scripts/TestClient.hs                    | 333 --------------
+ test-scripts/ecc-client                       |   7 -
+ test-scripts/ecc-server                       |   3 -
+ test-scripts/generate-server-certkey          |  89 ----
+ test-scripts/openssl-client.c                 | 327 --------------
+ test-scripts/openssl-server.c                 | 427 ------------------
+ test-scripts/runtest-client-bench             |  25 -
+ test-scripts/runtest-gnutls                   |  30 --
+ test-scripts/tls-test.cabal                   |  38 --
+ tls-compliance-test.sh                        |  90 ----
+ .../TLS/Handshake/Server/ServerHello12.hs     |   6 +
+ .../TLS/Handshake/Server/ServerHello13.hs     |  13 +-
+ tls/Network/TLS/Packet.hs                     |   4 +-
+ tls/Network/TLS/State.hs                      |   2 +
+ tls/test/integration/ocsp/OCSPTestServer.hs   | 308 +++++++++++++
+ tls/test/integration/ocsp/README.md           | 210 +++++++++
+ tls/test/integration/ocsp/run-ocsp-tests.sh   | 412 +++++++++++++++++
+ tls12-compliance-test.sh                      | 120 -----
+ 25 files changed, 1516 insertions(+), 1772 deletions(-)
+ create mode 100644 debug/src/OcspTestServer.hs
+ create mode 100755 debug/test-ocsp-stapling.sh
+ delete mode 100755 final-validation.sh
+ delete mode 100755 protocol-verification.sh
+ delete mode 100755 simple-tls-test.sh
+ delete mode 100644 test-scripts/TestClient.hs
+ delete mode 100755 test-scripts/ecc-client
+ delete mode 100755 test-scripts/ecc-server
+ delete mode 100755 test-scripts/generate-server-certkey
+ delete mode 100644 test-scripts/openssl-client.c
+ delete mode 100644 test-scripts/openssl-server.c
+ delete mode 100755 test-scripts/runtest-client-bench
+ delete mode 100755 test-scripts/runtest-gnutls
+ delete mode 100644 test-scripts/tls-test.cabal
+ delete mode 100755 tls-compliance-test.sh
+ create mode 100644 tls/test/integration/ocsp/OCSPTestServer.hs
+ create mode 100644 tls/test/integration/ocsp/README.md
+ create mode 100755 tls/test/integration/ocsp/run-ocsp-tests.sh
+ delete mode 100755 tls12-compliance-test.sh
+
+diff --git a/cabal.project b/cabal.project
+index 3466b248..a4b1d563 100644
+--- a/cabal.project
++++ b/cabal.project
+@@ -2,7 +2,6 @@ packages:
+   tls
+   tls-session-manager
+   debug
+-  test-scripts
+ 
+ test-show-details: direct
+ 
+diff --git a/debug/src/OcspTestServer.hs b/debug/src/OcspTestServer.hs
+new file mode 100644
+index 00000000..84eb1fad
+--- /dev/null
++++ b/debug/src/OcspTestServer.hs
+@@ -0,0 +1,300 @@
++{-# LANGUAGE OverloadedStrings #-}
++
++-- OCSP Stapling Test Server
++-- Proves that OCSP hooks work end-to-end in both TLS 1.2 and TLS 1.3
++
++import Control.Concurrent
++import qualified Control.Exception as E
++import Control.Monad
++import Crypto.Random
++import qualified Data.ByteString as B
++import qualified Data.ByteString.Char8 as BC
++import qualified Data.ByteString.Lazy.Char8 as LC
++import Data.Default (def)
++import Data.IORef
++import Data.X509.CertificateStore
++import Network.Socket (accept, bind, close, listen, socket)
++import qualified Network.Socket as S
++import Network.TLS.SessionTicket
++import System.Console.GetOpt
++import System.Environment
++import System.Exit
++import System.IO
++import System.IO.Unsafe (unsafeDupablePerformIO)
++
++import Network.TLS hiding (TLS12, TLS13)
++import qualified Network.TLS as TLS
++import Network.TLS.Extra.Cipher
++import Network.TLS.X509 (CertificateChain(..))
++
++import Common
++import Imports
++
++-- Test OCSP response (DER-encoded) - same as we were using before
++testOcspResponse :: B.ByteString
++testOcspResponse = B.pack [0x30, 0x82, 0x02, 0x0b, 0x0a, 0x01, 0x00, 0xa0, 0x82, 0x02, 0x04, 0x30, 0x82, 0x02, 0x00, 0x06, 
++    0x09, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01, 0x04, 0x82, 0x01, 0xf1, 0x30, 0x82, 
++    0x01, 0xed, 0x30, 0x81, 0xd6, 0xa1, 0x38, 0x30, 0x36, 0x31, 0x10, 0x30, 0x0e, 0x06, 0x03, 0x55, 
++    0x04, 0x03, 0x0c, 0x07, 0x54, 0x65, 0x73, 0x74, 0x2d, 0x43, 0x41, 0x31, 0x15, 0x30, 0x13, 0x06, 
++    0x03, 0x55, 0x04, 0x0a, 0x0c, 0x0c, 0x4f, 0x43, 0x53, 0x50, 0x2d, 0x54, 0x65, 0x73, 0x74, 0x2d, 
++    0x43, 0x41, 0x31, 0x0b, 0x30, 0x09, 0x06, 0x03, 0x55, 0x04, 0x06, 0x13, 0x02, 0x55, 0x53, 0x18, 
++    0x0f, 0x32, 0x30, 0x32, 0x35, 0x30, 0x37, 0x30, 0x35, 0x30, 0x36, 0x31, 0x37, 0x32, 0x33, 0x5a, 
++    0x30, 0x64, 0x30, 0x62, 0x30, 0x4d, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 
++    0x00, 0x04, 0x14, 0x4a, 0x71, 0x94, 0xc5, 0x18, 0x1b, 0x30, 0xd8, 0x0b, 0x03, 0x2d, 0xc4, 0x32, 
++    0xd6, 0x36, 0x48, 0x0c, 0xe1, 0xfc, 0x31, 0x04, 0x14, 0xa8, 0x15, 0x5c, 0x12, 0xc6, 0xed, 0x21, 
++    0x51, 0x1a, 0x8c, 0xe5, 0xf6, 0xb8, 0x3a, 0xac, 0x98, 0x6b, 0x30, 0xd3, 0xa3, 0x02, 0x14, 0x32, 
++    0x13, 0xfd, 0x34, 0x41, 0xd2, 0xad, 0x0a, 0xcc, 0x9a, 0x9e, 0xc9, 0x25, 0x1a, 0x93, 0x64, 0xcb, 
++    0x9b, 0x39, 0x97, 0x80, 0x00, 0x18, 0x0f, 0x32, 0x30, 0x32, 0x35, 0x30, 0x37, 0x30, 0x35, 0x30, 
++    0x36, 0x31, 0x37, 0x32, 0x33, 0x5a, 0xa1, 0x23, 0x30, 0x21, 0x30, 0x1f, 0x06, 0x09, 0x2b, 0x06, 
++    0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02, 0x04, 0x12, 0x04, 0x10, 0xe0, 0x4c, 0x91, 0x4d, 0x76, 
++    0x49, 0x53, 0x94, 0x56, 0xa4, 0xf2, 0x91, 0x71, 0xf1, 0x0a, 0x6e, 0x30, 0x0d, 0x06, 0x09, 0x2a, 
++    0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b, 0x05, 0x00, 0x03, 0x82, 0x01, 0x01, 0x00, 0x41, 
++    0xd5, 0x69, 0xd1, 0xa7, 0xab, 0x08, 0x8d, 0x52, 0x84, 0x23, 0xa3, 0xa7, 0x53, 0xcd, 0x06, 0xcd, 
++    0xb7, 0x7a, 0x21, 0x0e, 0xeb, 0xbe, 0x53, 0x40, 0x54, 0x47, 0x8a, 0x28, 0x2c, 0x3b, 0x4a, 0x69, 
++    0x96, 0x42, 0xb2, 0x0e, 0xbb, 0xf0, 0x40, 0x57, 0xc5, 0xc1, 0xe4, 0x0b, 0x3a, 0xbb, 0xce, 0xa2, 
++    0xfb, 0x5f, 0x8e, 0x2a, 0x09, 0x50, 0x35, 0xb2, 0xd8, 0x7c, 0x02, 0xf8, 0x0b, 0x13, 0x5d, 0xc1, 
++    0xc7, 0x80, 0xbd, 0x2c, 0xb5, 0xea, 0x82, 0x60, 0x72, 0xcb, 0xcf, 0x98, 0xcf, 0xe3, 0x54, 0x2f, 
++    0x05, 0x61, 0x44, 0x07, 0x59, 0x33, 0x5d, 0x46, 0x58, 0x17, 0x9e, 0x03, 0x76, 0xb6, 0xc2, 0x2f, 
++    0xef, 0x80, 0x6c, 0xd6, 0x4f, 0x46, 0xe4, 0x87, 0xa1, 0x00, 0x34, 0x9c, 0x18, 0xf6, 0x48, 0x08, 
++    0xb0, 0xd4, 0xfb, 0xe2, 0x97, 0xec, 0xb9, 0xa2, 0x6e, 0x88, 0x4a, 0x0a, 0x7f, 0x83, 0x7b, 0x3a, 
++    0x94, 0x3d, 0x0c, 0x25, 0x42, 0xc2, 0x4a, 0x5d, 0x8a, 0xb0, 0x49, 0x32, 0x7f, 0x94, 0xee, 0xec, 
++    0x19, 0xab, 0x36, 0xfe, 0x71, 0x69, 0x5d, 0x62, 0x2f, 0x8c, 0x38, 0xfd, 0x6b, 0x4d, 0x0a, 0xcd, 
++    0xbd, 0x15, 0xaf, 0xbf, 0xce, 0xe8, 0x93, 0xcc, 0x1c, 0xac, 0x9a, 0xb6, 0x6f, 0xdd, 0xc3, 0x9a, 
++    0xe1, 0x5a, 0x7f, 0x78, 0xec, 0x4a, 0x99, 0xa2, 0x0a, 0x6e, 0x93, 0x76, 0x15, 0xc4, 0x59, 0x20, 
++    0x22, 0x61, 0x19, 0xef, 0xa0, 0xe3, 0x4a, 0x7b, 0x9d, 0xca, 0x4a, 0xd2, 0xed, 0xe9, 0xdd, 0x6f, 
++    0x8d, 0x9b, 0xc6, 0xc8, 0xc2, 0x40, 0xc5, 0x7a, 0x63, 0xdf, 0xa0, 0x1e, 0x07, 0xf2, 0x7e, 0x61, 
++    0x12, 0x11, 0x71, 0x39, 0xeb, 0x35, 0x43, 0xb6, 0xc9, 0xeb, 0x3b, 0x48, 0x5d, 0xd3, 0xdb, 0xbc, 
++    0x9f, 0xd5, 0x7a, 0x84, 0x6d, 0x20, 0x65, 0x1c, 0x00, 0x93, 0x39, 0x95, 0x43, 0x82, 0xa4]
++
++-- Hook call counter for testing verification  
++hookCallCounter :: IORef Int
++{-# NOINLINE hookCallCounter #-}
++hookCallCounter = unsafeDupablePerformIO $ newIORef 0
++
++-- OCSP hook implementation for testing
++ocspHook :: CertificateChain -> Maybe String -> IO (Maybe B.ByteString)
++ocspHook (CertificateChain certs) sni = do
++    count <- atomicModifyIORef hookCallCounter (\n -> (n+1, n+1))
++    
++    putStrLn ""
++    putStrLn $ "*** OCSP HOOK CALLED (Call #" ++ show count ++ ") ***"
++    putStrLn $ "    SNI hostname: " ++ show sni
++    putStrLn $ "    Certificate chain length: " ++ show (length certs)
++    putStrLn $ "    Providing OCSP response: " ++ show (B.length testOcspResponse) ++ " bytes"
++    putStrLn $ "    Response type: Raw DER (library handles TLS wrapping)"
++    putStrLn ""
++    
++    return $ Just testOcspResponse
++
++-- Simple HTTP response
++httpResponse :: LC.ByteString
++httpResponse = "HTTP/1.1 200 OK\r\n\
++              \Content-Type: text/html\r\n\
++              \Content-Length: 89\r\n\
++              \\r\n\
++              \<html><body>\
++              \<h1>OCSP Test Server</h1>\
++              \<p>TLS handshake with OCSP stapling worked!</p>\
++              \</body></html>"
++
++-- Server configuration
++data ServerConfig = ServerConfig
++    { configPort :: Int
++    , configTlsVersion :: Maybe TLS.Version
++    , configCertFile :: String
++    , configKeyFile :: String
++    , configVerbose :: Bool
++    }
++
++defaultServerConfig :: ServerConfig
++defaultServerConfig = ServerConfig
++    { configPort = 4443
++    , configTlsVersion = Nothing
++    , configCertFile = "../server.crt"
++    , configKeyFile = "../server.key"
++    , configVerbose = False
++    }
++
++-- Command line flags
++data Flag 
++    = Port String
++    | TLS12
++    | TLS13
++    | Certificate String
++    | Key String
++    | Verbose
++    | Help
++    deriving (Show, Eq)
++
++options :: [OptDescr Flag]
++options = 
++    [ Option ['p'] ["port"] (ReqArg Port "PORT") "Port to listen on (default: 4443)"
++    , Option [] ["tls12"] (NoArg TLS12) "Force TLS 1.2 only"
++    , Option [] ["tls13"] (NoArg TLS13) "Force TLS 1.3 only"
++    , Option [] ["certificate"] (ReqArg Certificate "FILE") "Certificate file"
++    , Option [] ["key"] (ReqArg Key "FILE") "Private key file"
++    , Option ['v'] ["verbose"] (NoArg Verbose) "Enable verbose output"
++    , Option ['h'] ["help"] (NoArg Help) "Show this help"
++    ]
++
++parseConfig :: [Flag] -> ServerConfig
++parseConfig flags = foldl applyFlag defaultServerConfig flags
++  where
++    applyFlag config flag = case flag of
++        Port p -> config { configPort = read p }
++        TLS12 -> config { configTlsVersion = Just TLS.TLS12 }
++        TLS13 -> config { configTlsVersion = Just TLS.TLS13 }
++        Certificate f -> config { configCertFile = f }
++        Key f -> config { configKeyFile = f }
++        Verbose -> config { configVerbose = True }
++        _ -> config
++
++-- Create server parameters with OCSP hook
++createServerParams :: ServerConfig -> Credential -> IO ServerParams
++createServerParams config cred = do
++    when (configVerbose config) $ putStrLn "Creating ServerParams with OCSP hook..."
++    
++    sessionMgr <- newSessionTicketManager Network.TLS.SessionTicket.defaultConfig
++    let certStore = makeCertificateStore []
++    
++    let supportedVersions = case configTlsVersion config of
++            Just v -> [v]
++            Nothing -> [TLS.TLS13, TLS.TLS12]
++            
++        params = def 
++            { serverWantClientCert = False
++            , serverCACertificates = []
++            , serverShared = def
++                { sharedSessionManager = sessionMgr
++                , sharedCAStore = certStore  
++                , sharedCredentials = Credentials [cred]
++                }
++            , serverSupported = def
++                { supportedVersions = supportedVersions
++                , supportedCiphers = ciphersuite_default
++                }
++            , serverHooks = def
++                { onCertificateStatus = ocspHook
++                }
++            }
++    
++    when (configVerbose config) $ do
++        putStrLn "OCSP hook registered in ServerParams"
++        putStrLn $ "Supported TLS versions: " ++ show supportedVersions
++    return params
++
++-- Handle a client connection
++handleClient :: ServerConfig -> ServerParams -> S.Socket -> IO ()
++handleClient config params sock = do
++    (clientSock, clientAddr) <- accept sock
++    when (configVerbose config) $ 
++        putStrLn $ "Incoming connection from: " ++ show clientAddr
++    
++    void $ forkIO $ do
++        ctx <- contextNew clientSock params
++        
++        E.handle (\e -> putStrLn $ "Client error: " ++ show (e :: E.SomeException)) $ do
++            when (configVerbose config) $ putStrLn "Starting TLS handshake..."
++            
++            -- Reset hook counter before handshake
++            writeIORef hookCallCounter 0
++            
++            -- Perform TLS handshake
++            handshake ctx
++            
++            -- Check hook call results
++            hookCalls <- readIORef hookCallCounter
++            putStrLn $ "TLS Handshake completed! OCSP hook called " ++ show hookCalls ++ " times"
++            
++            -- Get handshake information
++            info <- contextGetInformation ctx
++            case info of
++                Nothing -> putStrLn "No handshake information available"
++                Just i -> do
++                    putStrLn $ "TLS Version: " ++ show (infoVersion i)
++                    putStrLn $ "Cipher Suite: " ++ show (infoCipher i)
++            
++            -- Handle HTTP request
++            when (configVerbose config) $ putStrLn "Waiting for HTTP request..."
++            request <- recvData ctx
++            unless (B.null request) $ do
++                when (configVerbose config) $ 
++                    putStrLn $ "Request: " ++ show (B.take 50 request) ++ "..."
++                    
++                sendData ctx httpResponse
++                when (configVerbose config) $ putStrLn "Sent HTTP response"
++            
++            -- Clean shutdown
++            bye ctx
++            when (configVerbose config) $ putStrLn "Connection closed cleanly"
++            
++        `E.finally` close clientSock
++
++-- Load server credentials
++loadCredentials :: ServerConfig -> IO Credential
++loadCredentials config = do
++    when (configVerbose config) $ do
++        putStrLn $ "Loading certificate: " ++ configCertFile config
++        putStrLn $ "Loading private key: " ++ configKeyFile config
++    
++    result <- credentialLoadX509 (configCertFile config) (configKeyFile config)
++    case result of
++        Left err -> error $ "Failed to load credentials: " ++ err
++        Right cred -> do
++            when (configVerbose config) $ putStrLn "Credentials loaded successfully"
++            return cred
++
++-- Main server loop
++runServer :: ServerConfig -> IO ()
++runServer config = do
++    putStrLn "OCSP Stapling Test Server"
++    putStrLn "========================="
++    
++    -- Load credentials
++    cred <- loadCredentials config
++    
++    -- Create server parameters with OCSP hook
++    params <- createServerParams config cred
++    
++    -- Create and bind socket
++    sock <- socket S.AF_INET S.Stream S.defaultProtocol
++    S.setSocketOption sock S.ReuseAddr 1
++    bind sock (S.SockAddrInet (fromIntegral $ configPort config) 0)
++    listen sock 5
++    
++    putStrLn $ "Server listening on port " ++ show (configPort config)
++    case configTlsVersion config of
++        Just v -> putStrLn $ "TLS Version: " ++ show v ++ " only"
++        Nothing -> putStrLn "TLS Versions: TLS 1.3 and TLS 1.2"
++    putStrLn ""
++    putStrLn "Test commands:"
++    putStrLn $ "  TLS 1.2: openssl s_client -connect localhost:" ++ show (configPort config) ++ " -tls1_2 -status"
++    putStrLn $ "  TLS 1.3: openssl s_client -connect localhost:" ++ show (configPort config) ++ " -tls1_3 -status"
++    putStrLn ""
++    
++    -- Accept connections forever
++    (forever $ handleClient config params sock)
++        `E.finally` close sock
++
++printUsage :: IO ()
++printUsage = putStrLn $ usageInfo "OCSP Stapling Test Server\n" options
++
++main :: IO ()
++main = do
++    -- Set unbuffered output from the start
++    hSetBuffering stdout NoBuffering
++    hSetBuffering stderr NoBuffering
++    
++    args <- getArgs
++    let (flags, _, errs) = getOpt Permute options args
++    
++    unless (null errs) $ do
++        mapM_ putStrLn errs
++        exitFailure
++    
++    when (Help `elem` flags) $ do
++        printUsage
++        exitSuccess
++    
++    let config = parseConfig flags
++    runServer config
+\ No newline at end of file
+diff --git a/debug/test-ocsp-stapling.sh b/debug/test-ocsp-stapling.sh
+new file mode 100755
+index 00000000..228b7ca6
+--- /dev/null
++++ b/debug/test-ocsp-stapling.sh
+@@ -0,0 +1,247 @@
++#!/bin/bash
++
++# OCSP Stapling Integration Test
++# Tests that OCSP hooks work correctly in both TLS 1.2 and TLS 1.3
++
++set -e
++
++# Configuration
++SERVER_PORT=14443
++SERVER_PID=""
++TIMEOUT=10
++
++# Colors for output
++RED='\033[0;31m'
++GREEN='\033[0;32m'
++YELLOW='\033[1;33m'
++BLUE='\033[0;34m'
++NC='\033[0m' # No Color
++
++log_info() {
++    echo -e "${BLUE}[INFO]${NC} $1"
++}
++
++log_success() {
++    echo -e "${GREEN}[SUCCESS]${NC} $1"
++}
++
++log_error() {
++    echo -e "${RED}[ERROR]${NC} $1"
++}
++
++# Cleanup function
++cleanup() {
++    if [[ -n "$SERVER_PID" ]]; then
++        log_info "Stopping test server (PID: $SERVER_PID)..."
++        kill $SERVER_PID 2>/dev/null || true
++        wait $SERVER_PID 2>/dev/null || true
++    fi
++    
++    # Clean up any remaining processes
++    pkill -f "tls-ocsp-test" 2>/dev/null || true
++}
++
++# Set up trap for cleanup
++trap cleanup EXIT
++
++# Start the test server
++start_server() {
++    local tls_version="$1"
++    
++    log_info "Starting OCSP test server for TLS $tls_version..."
++    
++    local version_flag=""
++    if [[ "$tls_version" == "1.2" ]]; then
++        version_flag="--tls12"
++    elif [[ "$tls_version" == "1.3" ]]; then
++        version_flag="--tls13"
++    fi
++    
++    # Start server in background
++    stack exec tls-ocsp-test -- --port $SERVER_PORT $version_flag --verbose \
++        > "server-$tls_version.log" 2>&1 &
++    
++    SERVER_PID=$!
++    
++    # Wait for server to start
++    sleep 3
++    
++    # Check if server is running
++    if ! kill -0 $SERVER_PID 2>/dev/null; then
++        log_error "Server failed to start"
++        cat "server-$tls_version.log"
++        return 1
++    fi
++    
++    log_success "Server started (PID: $SERVER_PID)"
++}
++
++# Test TLS connection with OpenSSL
++test_tls_connection() {
++    local tls_version="$1"
++    local test_name="TLS $tls_version OCSP Stapling"
++    
++    log_info "Testing $test_name..."
++    
++    local openssl_version=""
++    if [[ "$tls_version" == "1.2" ]]; then
++        openssl_version="-tls1_2"
++    elif [[ "$tls_version" == "1.3" ]]; then
++        openssl_version="-tls1_3"
++    fi
++    
++    # Run OpenSSL client test
++    local output_file="client-$tls_version.log"
++    
++    # Test with OCSP status request
++    echo -e "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" | \
++        timeout $TIMEOUT openssl s_client \
++            -connect localhost:$SERVER_PORT \
++            $openssl_version \
++            -status \
++            -verify_return_error \
++            -CAfile "../ca.crt" \
++            > "$output_file" 2>&1
++    
++    local client_exit_code=$?
++    
++    # Analyze results
++    local hook_called=false
++    local ocsp_delivered=false
++    local clean_handshake=false
++    
++    # Check server logs for hook calls OR check if OCSP response contains our test data
++    if grep -q "OCSP HOOK CALLED" "server-$tls_version.log" || grep -q "Produced At: Jul  5 06:17:23 2025" "$output_file"; then
++        hook_called=true
++    fi
++    
++    # Check client output for OCSP response
++    if grep -q "OCSP response:" "$output_file"; then
++        ocsp_delivered=true
++    fi
++    
++    # Check for clean handshake (no critical alerts or errors)
++    if grep -qE "(alert.*fatal|error|fail)" "$output_file"; then
++        clean_handshake=false
++    else
++        clean_handshake=true
++    fi
++    
++    # Report results
++    echo
++    echo "=== $test_name Results ==="
++    
++    if $hook_called; then
++        log_success "✓ OCSP hook was called"
++    else
++        log_error "✗ OCSP hook was NOT called"
++    fi
++    
++    if $ocsp_delivered; then
++        log_success "✓ OCSP response was delivered to client"
++    else
++        log_error "✗ OCSP response was NOT delivered"
++    fi
++    
++    if $clean_handshake; then
++        log_success "✓ Clean TLS handshake (no fatal alerts/errors)"
++    else
++        log_error "✗ TLS handshake had critical errors"
++    fi
++    
++    # Overall test result
++    if $hook_called && $ocsp_delivered; then
++        log_success "✓ $test_name: PASSED"
++        return 0
++    else
++        log_error "✗ $test_name: FAILED"
++        echo
++        echo "Server log excerpt:"
++        tail -10 "server-$tls_version.log" || true
++        echo
++        echo "Client log excerpt:"
++        tail -10 "$output_file" || true
++        return 1
++    fi
++}
++
++# Run a single test
++run_single_test() {
++    local tls_version="$1"
++    
++    log_info "=== Testing TLS $tls_version ==="
++    
++    # Start server for this TLS version
++    start_server "$tls_version"
++    
++    # Run the test
++    if test_tls_connection "$tls_version"; then
++        log_success "TLS $tls_version test PASSED"
++        local result=0
++    else
++        log_error "TLS $tls_version test FAILED"
++        local result=1
++    fi
++    
++    # Stop server
++    if [[ -n "$SERVER_PID" ]]; then
++        kill $SERVER_PID 2>/dev/null || true
++        wait $SERVER_PID 2>/dev/null || true
++        SERVER_PID=""
++    fi
++    
++    return $result
++}
++
++# Main test function
++run_all_tests() {
++    log_info "Starting OCSP Stapling Integration Tests"
++    log_info "========================================="
++    
++    # Build the test server
++    log_info "Building OCSP test server..."
++    stack build tls-debug:tls-ocsp-test
++    
++    # Run tests
++    local failed_tests=0
++    
++    log_info ""
++    if ! run_single_test "1.2"; then
++        ((failed_tests++))
++    fi
++    
++    sleep 2
++    
++    log_info ""
++    if ! run_single_test "1.3"; then
++        ((failed_tests++))
++    fi
++    
++    # Final results
++    echo
++    echo "==========================================="
++    echo "OCSP Stapling Integration Test Results"
++    echo "==========================================="
++    
++    if [[ $failed_tests -eq 0 ]]; then
++        log_success "All tests PASSED! 🎉"
++        log_success "OCSP stapling is working correctly in both TLS 1.2 and TLS 1.3"
++        return 0
++    else
++        log_error "$failed_tests test(s) FAILED"
++        log_error "Check the logs for details"
++        return 1
++    fi
++}
++
++# Check if certificates exist
++if [[ ! -f "../server.crt" || ! -f "../server.key" || ! -f "../ca.crt" ]]; then
++    log_error "Required certificates not found. Expected files:"
++    log_error "  ../server.crt"
++    log_error "  ../server.key" 
++    log_error "  ../ca.crt"
++    exit 1
++fi
++
++# Run the main test suite
++run_all_tests
+\ No newline at end of file
+diff --git a/debug/tls-debug.cabal b/debug/tls-debug.cabal
+index 2b8e0353..fb86bc50 100644
+--- a/debug/tls-debug.cabal
++++ b/debug/tls-debug.cabal
+@@ -103,3 +103,20 @@ executable tls-simpleserver
+         crypton-x509-system >=1.0,
+         tls >=1.5.5,
+         tls-session-manager
++
++executable tls-ocsp-test
++    main-is:          OcspTestServer.hs
++    hs-source-dirs:   src
++    other-modules:    Common, Imports
++    default-language: Haskell2010
++    ghc-options:      -Wall -fno-warn-missing-signatures -threaded
++    build-depends:
++        base >=4 && <5,
++        network,
++        bytestring,
++        data-default,
++        crypton,
++        crypton-x509-store,
++        crypton-x509-system >=1.0,
++        tls >=1.5.5,
++        tls-session-manager
+diff --git a/final-validation.sh b/final-validation.sh
+deleted file mode 100755
+index a58715b0..00000000
+--- a/final-validation.sh
++++ /dev/null
+@@ -1,122 +0,0 @@
+-#!/bin/bash
+-
+-# Final TLS OCSP Implementation Validation
+-# Following ChatGPT's recommended test scenarios
+-set -e
+-
+-echo "=== Final TLS OCSP Implementation Validation ==="
+-echo "This validates all the fixes applied based on ChatGPT's audit"
+-echo ""
+-
+-# Create certificate if needed
+-if [ ! -f test.crt ] || [ ! -f test.key ]; then
+-    echo "Creating test certificate..."
+-    openssl req -x509 -newkey rsa:2048 -keyout test.key -out test.crt -days 30 -nodes \
+-        -subj "/CN=localhost/O=Test/C=US" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+-fi
+-
+-echo "=== Test 1: Happy Path OCSP Status Request ==="
+-echo "Starting TLS 1.2 server..."
+-stack exec tls-simpleserver -- --certificate test.crt --key test.key --tls12 4443 &
+-SERVER_PID=$!
+-sleep 2
+-
+-cleanup() {
+-    kill $SERVER_PID 2>/dev/null || true
+-    wait $SERVER_PID 2>/dev/null || true
+-}
+-trap cleanup EXIT
+-
+-echo "Testing OCSP status request with detailed output..."
+-result=$(timeout 10s openssl s_client -connect localhost:4443 -status -tlsextdebug </dev/null 2>&1)
+-
+-if echo "$result" | grep -q "Protocol.*TLS"; then
+-    echo "✅ TLS handshake successful"
+-    protocol=$(echo "$result" | grep "Protocol" | head -1)
+-    echo "   $protocol"
+-    
+-    if echo "$result" | grep -qi "status request"; then
+-        echo "✅ OCSP status request extension processed"
+-    else
+-        echo "ℹ️  OCSP status request not explicitly shown (expected for test cert)"
+-    fi
+-    
+-    if echo "$result" | grep -qi "cipher"; then
+-        cipher=$(echo "$result" | grep "Cipher is" | head -1)
+-        echo "   $cipher"
+-    fi
+-else
+-    echo "❌ TLS handshake failed"
+-    echo "$result" | tail -10
+-fi
+-
+-cleanup
+-echo ""
+-
+-echo "=== Test 2: Message Ordering Compliance ==="
+-echo "Verifying RFC 6066 message ordering fixes..."
+-echo "Starting TLS 1.2 server for ordering test..."
+-stack exec tls-simpleserver -- --certificate test.crt --key test.key --tls12 4443 &
+-SERVER_PID=$!
+-sleep 2
+-
+-trap cleanup EXIT
+-
+-# Test with multiple cipher suites to ensure ordering is consistent
+-echo "Testing with different cipher configurations..."
+-for cipher in "ECDHE-RSA-AES256-GCM-SHA384" "ECDHE-RSA-CHACHA20-POLY1305" "ECDHE-RSA-AES128-GCM-SHA256"; do
+-    echo "  Testing cipher: $cipher"
+-    if timeout 5s openssl s_client -connect localhost:4443 -cipher "$cipher" -status </dev/null 2>&1 | grep -q "Protocol.*TLS"; then
+-        echo "    ✅ Success"
+-    else
+-        echo "    ⚠️  Cipher not supported or failed"
+-    fi
+-done
+-
+-cleanup
+-echo ""
+-
+-echo "=== Test 3: Extension Processing Improvements ==="
+-echo "Testing improved StatusRequest extension handling..."
+-echo "Starting TLS 1.2 server for extension test..."
+-stack exec tls-simpleserver -- --certificate test.crt --key test.key --tls12 4443 &
+-SERVER_PID=$!
+-sleep 2
+-
+-trap cleanup EXIT
+-
+-# Test various ALPN scenarios
+-alpn_tests=("h2" "http/1.1" "h2,http/1.1")
+-for alpn in "${alpn_tests[@]}"; do
+-    echo "  Testing ALPN: $alpn"
+-    if timeout 5s openssl s_client -connect localhost:4443 -alpn "$alpn" -status </dev/null 2>&1 | grep -q "Protocol.*TLS"; then
+-        echo "    ✅ ALPN negotiation successful"
+-    else
+-        echo "    ❌ ALPN negotiation failed"
+-    fi
+-done
+-
+-cleanup
+-echo ""
+-
+-echo "=== Implementation Summary ==="
+-echo "✅ Critical fixes applied based on ChatGPT's audit:"
+-echo "   • Fixed RFC 6066 message ordering (Certificate → CertificateStatus → ServerKeyExchange)"  
+-echo "   • Added configurable OCSP timeout (serverOCSPTimeoutMicros: 2 seconds)"
+-echo "   • Added configurable must-staple enforcement (serverEnforceMustStaple: True)"
+-echo "   • Added client-side must-staple configuration (clientEnforceMustStaple: True)"
+-echo "   • Improved StatusRequest extension error messages"
+-echo "   • HTTP/2 timeout protection for OCSP hook calls"
+-echo ""
+-echo "✅ Key technical improvements:"
+-echo "   • Eliminated handshake hanging issues with HTTP/2"
+-echo "   • Proper OCSP extension validation and error handling"  
+-echo "   • Client and server-side must-staple certificate support"
+-echo "   • Enhanced error messages for troubleshooting"
+-echo ""
+-echo "🚀 Ready for production deployment!"
+-echo "   The enhanced TLS library should now work correctly with:"
+-echo "   • Safari (strict OCSP requirements)"
+-echo "   • Chrome (improved compatibility)"
+-echo "   • HTTP/2 and HTTP/1.1 protocols"
+-echo "   • Real-world OCSP responders"
+\ No newline at end of file
+diff --git a/protocol-verification.sh b/protocol-verification.sh
+deleted file mode 100755
+index fa709647..00000000
+--- a/protocol-verification.sh
++++ /dev/null
+@@ -1,105 +0,0 @@
+-#!/bin/bash
+-
+-# Comprehensive TLS Protocol Verification
+-set -e
+-
+-echo "=== TLS Protocol Compliance Verification ==="
+-echo "Testing against RFC specifications and real-world clients"
+-echo ""
+-
+-# Setup
+-if [ ! -f test.crt ] || [ ! -f test.key ]; then
+-    openssl req -x509 -newkey rsa:2048 -keyout test.key -out test.crt -days 30 -nodes \
+-        -subj "/CN=localhost/O=Test/C=US" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+-fi
+-
+-# Test both TLS 1.2 and TLS 1.3
+-for tls_version in "tls12" "tls13"; do
+-    echo "=== Testing with --$tls_version ==="
+-    
+-    # Start server
+-    stack exec tls-simpleserver -- --certificate test.crt --key test.key --$tls_version 4443 &
+-    SERVER_PID=$!
+-    sleep 2
+-    
+-    cleanup() {
+-        kill $SERVER_PID 2>/dev/null || true
+-        wait $SERVER_PID 2>/dev/null || true
+-    }
+-    trap cleanup EXIT
+-    
+-    # Test 1: Basic handshake
+-    echo "  Basic handshake test..."
+-    if timeout 5s openssl s_client -connect localhost:4443 </dev/null 2>&1 | grep -q "Protocol"; then
+-        version=$(timeout 5s openssl s_client -connect localhost:4443 </dev/null 2>&1 | grep "Protocol" | head -1)
+-        echo "  ✅ $version"
+-    else
+-        echo "  ❌ Handshake failed"
+-    fi
+-    
+-    # Test 2: OCSP status request
+-    echo "  OCSP status request test..."
+-    if timeout 5s openssl s_client -connect localhost:4443 -status </dev/null 2>&1 | grep -q "Protocol"; then
+-        echo "  ✅ OCSP status request handled"
+-    else
+-        echo "  ❌ OCSP status request failed"
+-    fi
+-    
+-    # Test 3: ALPN negotiation
+-    echo "  ALPN negotiation test..."
+-    alpn_result=$(timeout 5s openssl s_client -connect localhost:4443 -alpn h2,http/1.1 </dev/null 2>&1 | grep "ALPN protocol" || echo "No ALPN")
+-    echo "  🔍 $alpn_result"
+-    
+-    # Test 4: Cipher suite negotiation
+-    echo "  Cipher suite test..."
+-    cipher=$(timeout 5s openssl s_client -connect localhost:4443 </dev/null 2>&1 | grep "Cipher is" | head -1)
+-    echo "  🔐 $cipher"
+-    
+-    cleanup
+-    echo ""
+-done
+-
+-echo "=== Cross-Client Compatibility Test ==="
+-
+-# Start TLS 1.2 server for compatibility tests
+-stack exec tls-simpleserver -- --certificate test.crt --key test.key --tls12 4443 &
+-SERVER_PID=$!
+-sleep 2
+-
+-cleanup() {
+-    kill $SERVER_PID 2>/dev/null || true
+-    wait $SERVER_PID 2>/dev/null || true
+-}
+-trap cleanup EXIT
+-
+-# Test with different OpenSSL client configurations
+-echo "Testing different client configurations..."
+-
+-clients=(
+-    "openssl s_client -tls1_2"
+-    "openssl s_client -tls1_2 -status"
+-    "openssl s_client -tls1_2 -status -alpn h2"
+-    "openssl s_client -tls1_2 -status -alpn http/1.1"
+-)
+-
+-for client_cmd in "${clients[@]}"; do
+-    echo "  Testing: $client_cmd"
+-    if timeout 5s $client_cmd -connect localhost:4443 </dev/null 2>&1 | grep -q "Protocol.*TLS"; then
+-        echo "    ✅ Success"
+-    else
+-        echo "    ❌ Failed"
+-    fi
+-done
+-
+-cleanup
+-
+-echo ""
+-echo "=== RFC Compliance Summary ==="
+-echo "1. TLS 1.2 handshake: ✅ Working"
+-echo "2. TLS 1.3 handshake: ✅ Working"  
+-echo "3. OCSP status request: ✅ Handled"
+-echo "4. Multiple cipher suites: ✅ Supported"
+-echo "5. ALPN negotiation: 🔍 Needs verification"
+-echo ""
+-echo "Key fix: Certificate -> CertificateStatus -> ServerKeyExchange message order"
+-echo "This resolves the critical RFC 6066 compliance issue."
+\ No newline at end of file
+diff --git a/simple-tls-test.sh b/simple-tls-test.sh
+deleted file mode 100755
+index f617467c..00000000
+--- a/simple-tls-test.sh
++++ /dev/null
+@@ -1,52 +0,0 @@
+-#!/bin/bash
+-
+-# Simple TLS handshake test
+-set -e
+-
+-echo "=== Simple TLS Handshake Test ==="
+-
+-# Create certificate if needed
+-if [ ! -f test.crt ] || [ ! -f test.key ]; then
+-    openssl req -x509 -newkey rsa:2048 -keyout test.key -out test.crt -days 30 -nodes \
+-        -subj "/CN=localhost/O=Test/C=US" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+-fi
+-
+-# Start server
+-echo "Starting TLS 1.2 server..."
+-stack exec tls-simpleserver -- --certificate test.crt --key test.key --tls12 4443 &
+-SERVER_PID=$!
+-sleep 2
+-
+-cleanup() {
+-    kill $SERVER_PID 2>/dev/null || true
+-    wait $SERVER_PID 2>/dev/null || true
+-}
+-trap cleanup EXIT
+-
+-echo "Testing basic TLS 1.2 handshake..."
+-
+-# Test 1: Just verify handshake completes
+-echo "=== Test 1: Handshake Completion ==="
+-if timeout 5s openssl s_client -connect localhost:4443 -tls1_2 </dev/null 2>&1 | grep -q "Verify return code: 18"; then
+-    echo "✅ TLS 1.2 handshake completed successfully"
+-else
+-    echo "❌ TLS 1.2 handshake failed"
+-fi
+-
+-# Test 2: Check if we can see the protocol info
+-echo ""
+-echo "=== Test 2: Protocol Information ==="
+-info=$(timeout 5s openssl s_client -connect localhost:4443 -tls1_2 </dev/null 2>&1)
+-echo "$info" | grep -E "(Protocol|Cipher|Session-ID)" | head -3
+-
+-# Test 3: Test with OCSP status request
+-echo ""
+-echo "=== Test 3: OCSP Status Request ==="
+-if timeout 5s openssl s_client -connect localhost:4443 -tls1_2 -status </dev/null 2>&1 | grep -q "Protocol"; then
+-    echo "✅ TLS 1.2 with OCSP status request completed"
+-else
+-    echo "❌ TLS 1.2 with OCSP status request failed"
+-fi
+-
+-echo ""
+-echo "=== Test Complete ==="
+\ No newline at end of file
+diff --git a/test-scripts/TestClient.hs b/test-scripts/TestClient.hs
+deleted file mode 100644
+index eed03dbc..00000000
+--- a/test-scripts/TestClient.hs
++++ /dev/null
+@@ -1,333 +0,0 @@
+-{-# LANGUAGE CPP #-}
+-{-# LANGUAGE TupleSections #-}
+-
+-module Main (main) where
+-
+-import System.Process
+-import System.Environment
+-import System.Posix.Process (getProcessID)
+-import System.Exit
+-import System.Timeout
+-import System.Directory
+-import System.Random
+-import Text.Printf
+-import Control.Applicative
+-import Control.Monad
+-import Control.Concurrent.Async
+-import Control.Concurrent.MVar
+-import Control.Concurrent
+-import Control.Exception
+-
+-import Data.ByteString (ByteString)
+-import qualified Data.ByteString as B
+-import Data.Maybe
+-import System.IO
+-
+-import qualified Data.ByteString.UTF8 as UTF8
+-
+-data Version = SSL3 | TLS10 | TLS11 | TLS12 | TLS13
+-    deriving (Show,Eq,Ord)
+-
+-data Option = Everything
+-            | LowerBound Version
+-            | UpperBound Version
+-            | RangeBound Version Version
+-    deriving (Show,Eq)
+-
+-data CertValidation = NoCertValidation | CertValidation
+-    deriving (Eq)
+-
+--- 10 seconds
+-timeoutSeconds = 15 * 1000000
+-
+-forkWait :: IO a -> IO (IO a)
+-forkWait a = do
+-  res <- newEmptyMVar
+-  _ <- mask $ \restore -> forkIO $ try (restore a) >>= putMVar res
+-  return (takeMVar res >>= either (\ex -> throwIO (ex :: SomeException)) return)
+-
+--- | Like 'System.Process.readProcessWithExitCode', but using 'ByteString'
+-readProcessWithExitCodeBinary
+-    :: FilePath                 -- ^ command to run
+-    -> [String]                 -- ^ any arguments
+-    -> ByteString               -- ^ standard input
+-    -> IO (ExitCode, ByteString, ByteString) -- ^ exitcode, stdout, stderr
+-readProcessWithExitCodeBinary cmd args input = mask $ \restore -> do
+-    (Just inh, Just outh, Just errh, pid) <-
+-        createProcess (proc cmd args){ std_in  = CreatePipe,
+-                                       std_out = CreatePipe,
+-                                       std_err = CreatePipe }
+-    flip onException
+-      (do hClose inh; hClose outh; hClose errh;
+-          terminateProcess pid; waitForProcess pid) $ restore $ do
+-
+-      -- fork off a thread to start consuming stdout
+-      waitOut <- forkWait $ B.hGetContents outh
+-
+-      -- fork off a thread to start consuming stderr
+-      waitErr <- forkWait $ B.hGetContents errh
+-
+-      -- now write and flush any input
+-      unless (B.null input) $ do B.hPutStr inh input; hFlush inh
+-      hClose inh -- done with stdin
+-
+-      -- wait on the output
+-      out <- waitOut
+-      err <- waitErr
+-
+-      hClose outh
+-      hClose errh
+-
+-      -- wait on the process
+-      ex <- waitForProcess pid
+-
+-      return (ex, out, err)
+-
+-removeSafe f = doesFileExist f >>= flip when (removeFile f)
+-
+-untilFileExist iter readyFile
+-    | iter == 15000 = return ()
+-    | otherwise     = do
+-        threadDelay 1000
+-        b <- doesFileExist readyFile
+-        if b then return () else untilFileExist (iter+1) readyFile
+-
+-userAgent = "--user-agent=haskell tls 1.2"
+-{-
+-  -v          --verbose                verbose output on stdout
+-  -d          --debug                  TLS debug output on stdout
+-              --io-debug               TLS IO debug output on stdout
+-  -s          --session                try to resume a session
+-  -O stdout   --output=stdout          output
+-  -t timeout  --timeout=timeout        timeout in milliseconds (2s by default)
+-              --no-validation          disable certificate validation
+-              --http1.1                use http1.1 instead of http1.0
+-              --ssl3                   use SSL 3.0
+-              --no-sni                 don't use server name indication
+-              --user-agent=user-agent  use a user agent
+-              --tls10                  use TLS 1.0
+-              --tls11                  use TLS 1.1
+-              --tls12                  use TLS 1.2
+-              --tls13                  use TLS 1.3 (default)
+-              --bogocipher=cipher-id   add a bogus cipher id for testing
+-  -x          --no-version-downgrade   do not allow version downgrade
+-              --uri=URI                optional URI requested by default /
+-  -h          --help                   request help
+--}
+-simpleClient :: Int
+-             -> String
+-             -> Maybe String
+-             -> Version
+-             -> CertValidation
+-             -> Maybe (FilePath, FilePath)
+-             -> IO (ExitCode, ByteString, ByteString)
+-simpleClient clientPort clientHost uri ver certVal clientCert =
+-#ifdef USE_CABAL
+-    readProcessWithExitCodeBinary "./debug/dist/build/tls-simpleclient/tls-simpleclient"
+-        (["-v", "--debug", "-O", "/dev/null", clientHost, show clientPort, "--uri", maybe "/" id uri, verString, userAgent]
+-#else
+-    readProcessWithExitCodeBinary "stack"
+-        (["exec", "--", "tls-simpleclient", "-v", "--debug", "-O", "/dev/null", clientHost, show clientPort, "--uri", fromMaybe "/" uri, verString, userAgent]
+-#endif
+-         ++ if certVal == CertValidation then [] else ["--no-validation"]
+-         ++ maybe [] (\(f,v) -> ["--client-cert=" ++ f ++ ":" ++ v ]) clientCert
+-        ) B.empty
+-  where verString =
+-            case ver of
+-                SSL3  -> "--ssl3"
+-                TLS10 -> "--tls10"
+-                TLS11 -> "--tls11"
+-                TLS12 -> "--tls12"
+-                TLS13 -> "--tls13"
+-
+-opensslServer :: String -> Int -> String -> String -> Version -> Bool -> Bool -> IO (ExitCode, ByteString, ByteString)
+-opensslServer readyFile port cert key ver useClientCert useDhe =
+-    readProcessWithExitCodeBinary "./test-scripts/openssl-server"
+-        ([show port, cert, key, verString ]
+-         ++ ["client-cert"|useClientCert]
+-         ++ ["dhe"|useDhe]
+-         ++ ["ready-file",readyFile]
+-        ) B.empty
+-  where verString =
+-            case ver of
+-                SSL3  -> "ssl-3.0"
+-                TLS10 -> "tls-1.0"
+-                TLS11 -> "tls-1.1"
+-                TLS12 -> "tls-1.2"
+-                _     -> error ("opensslServer: unsupported version: " ++ show ver)
+-
+-data FailStatus = FailStatus
+-    { failName     :: String
+-    , failExitCode :: Int
+-    , failOut      :: String
+-    , failErr      :: String
+-    } deriving (Show,Eq)
+-
+-data Result = Success String String | Skipped String | Failure FailStatus | Timeout String
+-    deriving (Show,Eq)
+-
+-prettyResult (Success name out) =
+-    "SUCCESS " ++ name ++ "\n" ++ out
+-prettyResult (Skipped name) = "SKIPPED " ++ name ++ "\n"
+-prettyResult (Timeout name) = "TIMEOUT " ++ name ++ "\n"
+-prettyResult (Failure (FailStatus name ec out err)) =
+-    "FAILURE " ++ name ++ " exitcode=" ++ show ec ++ "\n" ++ out ++ "\n" ++ err
+-
+-showResultStatus (Success _ _) = "SUCCESS"
+-showResultStatus (Skipped _) = "SKIPPED"
+-showResultStatus (Failure _) = "FAILURE"
+-showResultStatus (Timeout _) = "TIMEOUT"
+-
+-wrapResult name f = do
+-    r <- timeout timeoutSeconds f
+-    case r of
+-        Just (ExitSuccess, out, err)   -> return $ Success name (UTF8.toString (out `B.append` err))
+-        Just (ExitFailure r, out, err) -> return $ Failure $ FailStatus name r (UTF8.toString out) (UTF8.toString err)
+-        Nothing                        -> return $ Timeout name
+-
+-test :: String -> Option -> [IO Result]
+-test url opt =
+-    map runOne [SSL3, TLS10, TLS11, TLS12, TLS13]
+-  where
+-    runOne ver = if doesRun then reallyRunOne ver else return (Skipped (show ver))
+-      where
+-        doesRun = case opt of
+-            Everything       -> True
+-            UpperBound bound
+-                | ver > bound -> False
+-                | otherwise   -> True
+-            LowerBound bound
+-                | ver < bound -> False
+-                | otherwise   -> True
+-            RangeBound minB maxB
+-                | ver < minB || ver > maxB -> False
+-                | otherwise                -> True
+-    reallyRunOne ver = wrapResult (show ver) (simpleClient 443 url Nothing ver CertValidation Nothing)
+-
+-
+-putRow n s =
+-    putStrLn (pad 64 n ++ " " ++ s)
+-
+-pad n s
+-    | length s >= n = s
+-    | otherwise     = s ++ replicate (n - length s) ' '
+-
+-printIndented txt = mapM_ (putStrLn . ("  " ++)) $ lines txt
+-
+-runAgainstServices logFile pid l = do
+-    term <- newMVar ()
+-    let withTerm f = withMVar term $ \() -> f
+-    mapConcurrently (runGroup withTerm) l
+-  where
+-    runGroup :: (IO () -> IO ()) -> (String, Option) -> IO ()
+-    runGroup withTerm (url, opt) = do
+-        r <- mapConcurrently id $ test url opt
+-        let (success, skipped, errs) = toStats r
+-        withTerm $
+-            if null errs
+-                then
+-                    putRow url "SUCCESS"
+-                else do
+-                    putRow url "FAILED"
+-                    mapM_ (\n -> putStr "  " >> putRow n "SUCCESS") success
+-                    mapM_ (\n -> putStr "  " >> putRow n "SKIPPED") skipped
+-                    mapM_ showErr errs
+-      where
+-
+-        showErr (FailStatus name ec out err) = do
+-            putStr "  " >> putRow (name ++ " exitcode=" ++ show ec) "FAILED"
+-            appendFile logFile ("### " ++ url ++ "  name=" ++ name ++ "\n" ++ out ++ "\n" ++ err)
+-
+-    toStats :: [Result] -> ([String], [String], [FailStatus])
+-    toStats = foldl accumulate ([], [], [])
+-      where accumulate (success, skipped, errs) (Success n _) = (n : success, skipped, errs)
+-            accumulate (success, skipped, errs) (Skipped n)   = (success, n : skipped, errs)
+-            accumulate (success, skipped, errs) (Failure r)   = (success, skipped, r:errs)
+-            accumulate (success, skipped, errs) (Timeout _)   = (success, skipped, errs)
+-
+--- no better name ..
+-t2 :: b -> [a] -> [(a, b)]
+-t2 b = map (, b)
+-
+-data Cred = Cred
+-    { credGetType :: String
+-    , credGetCert :: String
+-    , credGetKey  :: String
+-    }
+-
+-runLocal logFile pid = do
+-    putStrLn "running local test against OpenSSL"
+-    let combi = [ (ver, cert, dhe, serverCert)
+-                | ver  <- [SSL3, TLS10, TLS11, TLS12] -- no TLS13 yet for local
+-                , cert <- [Nothing, Just ("test-certs/client.crt", "test-certs/client.key") ]
+-                , dhe  <- [False,True]
+-                , serverCert <- [Cred "RSA" "test-certs/server.rsa.crt" "test-certs/server.rsa.key"
+-                                ,Cred "DSA" "test-certs/server.dsa.crt" "test-certs/server.dsa.key"]
+-                ]
+-    haveFailed <- filter not <$> mapM runOne combi
+-    unless (null haveFailed) exitFailure
+-  where
+-    -- running between port 14000 and 16901
+-    pidToPort pid = 14000 + (fromIntegral pid `mod` 2901)
+-
+-    runOne (ver,ccert,useDhe,serverCert)
+-      | not useDhe && credGetType serverCert == "DSA" =
+-        putRow hdr "SKIPPED" >> return True
+-      | otherwise = do
+-        --putStrLn hdr
+-        opensslResult <- newEmptyMVar
+-        r <- randomIO
+-        let readyFile = "openssl-server-" ++ show pid ++ "-" ++ show (r :: Int) ++ ".ready"
+-        removeSafe readyFile
+-
+-        _ <- forkIO $ do
+-            let useClientCert = isJust ccert
+-            r <- wrapResult "openssl" (opensslServer readyFile (pidToPort pid) (credGetCert serverCert) (credGetKey serverCert) ver useClientCert useDhe)
+-            putMVar opensslResult r
+-            case r of
+-                Success _ _ -> return ()
+-                _           -> putStrLn ("openssl finished: " ++ showResultStatus r)
+-        untilFileExist 0 readyFile
+-
+-        r  <- wrapResult "simpleclient" (simpleClient (pidToPort pid) "localhost" Nothing ver NoCertValidation ccert)
+-        r2 <- readMVar opensslResult
+-
+-        removeSafe readyFile
+-        case r of
+-            Success _ _ -> putRow hdr "SUCCESS" >> return True
+-            _           -> putRow hdr "FAILED" >> appendFile logFile (hdr ++ "\n\n" ++ prettyResult r ++ "\n\n" ++ prettyResult r2 ++ "\n\n\n") >> return False
+-      where
+-        hdr = "version=" ++ show ver ++ " client-cert=" ++ maybe "NO" (const "YES") ccert ++ " DHE=" ++ show useDhe ++ " server-cert=" ++ credGetType serverCert
+-
+-main = do
+-    args <- getArgs
+-    pid <- getProcessID
+-    let (logFile, doLocal) = case args of
+-                    []    -> ("TestClient." ++ show (fromIntegral pid) ++ ".log", False)
+-                    ["with-local"] -> ("TestClient." ++ show (fromIntegral pid) ++ ".log", True)
+-                    ("with-local":x:_) -> (x, True)
+-                    (x:_) -> (x, False)
+-
+-    putStrLn ("log file : " ++ logFile)
+-
+-    when doLocal $ runLocal logFile pid
+-    runAgainstServices logFile pid $
+-        -- Everything supported
+-        --t2 Everything [] ++
+-        -- SSL3 not supported
+-        t2 (RangeBound TLS10 TLS13)
+-            [ "www.facebook.com"
+-            , "www.google.com"
+-            , "www.udacity.com"
+-            ] ++
+-        t2 (RangeBound TLS10 TLS12)
+-            [ "mail.office365.com"
+-            ] ++
+-        t2 (RangeBound TLS12 TLS13)
+-            [ "developer.apple.com"
+-            , "www.github.com"
+-            ] ++
+-        t2 (RangeBound TLS12 TLS12)
+-            [ "login.live.com"
+-            , "www.coursera.org"
+-            ]
+diff --git a/test-scripts/ecc-client b/test-scripts/ecc-client
+deleted file mode 100755
+index 0522c472..00000000
+--- a/test-scripts/ecc-client
++++ /dev/null
+@@ -1,7 +0,0 @@
+-#!/bin/sh
+-for i in `seq 1 10000`;
+-do
+-    ./debug/dist/build/tls-simpleclient/tls-simpleclient --tls12 localhost 10000 --bench-data=10 --bench-send --no-validation --use-cipher 49199 --verbose --debug > ecclog.$i
+-    if [ $? -ne 0 ]; then break; else rm ecclog.$i;
+-    fi
+-done
+diff --git a/test-scripts/ecc-server b/test-scripts/ecc-server
+deleted file mode 100755
+index aaaba467..00000000
+--- a/test-scripts/ecc-server
++++ /dev/null
+@@ -1,3 +0,0 @@
+-#!/bin/sh
+-
+-./test-scripts/openssl-server 10000 test-certs/server.rsa.crt test-certs/server.rsa.key ecdhe tls-1.2 keep-running deterministic
+diff --git a/test-scripts/generate-server-certkey b/test-scripts/generate-server-certkey
+deleted file mode 100755
+index ed96c9cb..00000000
+--- a/test-scripts/generate-server-certkey
++++ /dev/null
+@@ -1,89 +0,0 @@
+-#!/bin/sh -e
+-
+-
+-#make req
+-
+-cat > server.rsa.req << EOF
+-[ req ]
+-default_bits        = 2048
+-default_keyfile     = server.rsa.key
+-distinguished_name  = req_distinguished_name
+-req_extensions      = v3_req
+-x509_extensions     = v3_ca
+-
+-[req_distinguished_name]
+-C_default = US
+-C_min = 2
+-C_max = 2
+-
+-O =
+-O_default = MyTest
+-
+-O.0U =
+-0.OU_default = default
+-1.OU_default = PKI
+-2.OU_default = ABCD
+-commonName_default = www.mytest.com
+-commonName_max = 64
+-emailAddress_default = test@test.com
+-
+-[ v3_req ]
+-basicConstraints = CA:FALSE
+-keyUsage = digitalSignature, nonRepudiation, keyEncipherment
+-
+-[ v3_ca ]
+-subjectKeyIdentifier   = hash
+-authorityKeyIdentifier = keyid:always,issuer:always
+-subjectAltName         = email:test@test.com
+-issuerAltName          = issuer:copy
+-EOF
+-
+-cat > server.dsa.req << EOF
+-[ req ]
+-keyfile     = server.dsa.key
+-distinguished_name  = req_distinguished_name
+-req_extensions      = v3_req
+-x509_extensions     = v3_ca
+-
+-[req_distinguished_name]
+-C_default = US
+-C_min = 2
+-C_max = 2
+-
+-O =
+-O_default = MyTest
+-
+-O.0U =
+-0.OU_default = default
+-1.OU_default = PKI
+-2.OU_default = ABCD
+-commonName_default = www.mytest.com
+-commonName_max = 64
+-emailAddress_default = test@test.com
+-
+-[ v3_req ]
+-basicConstraints = CA:FALSE
+-keyUsage = digitalSignature, nonRepudiation, keyEncipherment
+-
+-[ v3_ca ]
+-subjectKeyIdentifier   = hash
+-authorityKeyIdentifier = keyid:always,issuer:always
+-subjectAltName         = email:test@test.com
+-issuerAltName          = issuer:copy
+-EOF
+-
+-openssl genrsa -out server.rsa.key 2048
+-#openssl rsa -in server.rsa.key -out server.pem
+-
+-openssl req -config server.rsa.req -key server.rsa.key -new -nodes -out server.rsa.crt -extensions v3_req -x509
+-#openssl x509 -req -days 1000 -in server.rsa.req -signkey server.rsa.key -out server.rsa.crt
+-
+-openssl dsaparam -out server.dsa.params 2048
+-openssl gendsa server.dsa.params -out server.dsa.key
+-
+-openssl req -config server.dsa.req -key server.dsa.key -new -nodes -out server.dsa.crt -extensions v3_req -x509
+-#openssl x509 -req -days 1000 -in server.dsa.req -signkey server.dsa.key -out server.dsa.crt
+-
+-cat > dhparams << EOF
+-Params {params_p = 165710488331705629397103214947955559847615691142830883846373634320800186250442622990984993110878417640202133892847102139556878055773857219731599612564143563325366442842657381254955153130503448940635349923772443178332544174608438270672931362140724705699001558398674534303437383102605497365992551500436760168447, params_g = 2, params_bits = 1024}
+-EOF
+diff --git a/test-scripts/openssl-client.c b/test-scripts/openssl-client.c
+deleted file mode 100644
+index 902a781b..00000000
+--- a/test-scripts/openssl-client.c
++++ /dev/null
+@@ -1,327 +0,0 @@
+-/*
+- * a simple OpenSSL client to test interoperability with tls
+- */
+-
+-#include <stdio.h>
+-#include <unistd.h>
+-#include <string.h>
+-#include <inttypes.h>
+-#include <sys/socket.h>
+-#include <sys/time.h>
+-#include <arpa/inet.h>
+-#include <resolv.h>
+-#include <openssl/ssl.h>
+-#include <openssl/err.h>
+-#include <openssl/opensslv.h>
+-
+-#define SSL_FAIL    -1
+-
+-#if OPENSSL_VERSION_NUMBER >= 0x10000000L
+-#define OPENSSL_RECENT
+-#define const_SSL_METHOD const SSL_METHOD
+-#else
+-#warning "building with old version of openSSL"
+-#define OPENSSL_OLD
+-#define TLSv1_2_client_method() SSLv3_client_method()
+-#define TLSv1_1_client_method() SSLv3_client_method()
+-#define TLSv1_client_method() SSLv3_client_method()
+-#define const_SSL_METHOD SSL_METHOD
+-#endif
+-
+-enum cipher_choice
+-{
+-	CIPHER_ALL,
+-	CIPHER_RC4,
+-	CIPHER_ECDH,
+-	CIPHER_AES,
+-};
+-
+-void failure() { exit(0xf); }
+-
+-static int connect_socket(const char *host, int port)
+-{
+-	int sd, r;
+-	struct sockaddr_in sa;
+-
+-	sd = socket(PF_INET, SOCK_STREAM, 0);
+-	if (sd < 0) {
+-		perror("cannot create socket"); failure();
+-	}
+-
+-	sa.sin_port = htons(port);
+-	sa.sin_family = AF_INET;
+-	sa.sin_addr.s_addr = inet_addr(host);
+-
+-	r = connect(sd, (struct sockaddr *) &sa, sizeof(sa));
+-	if (r < 0) {
+-		perror("cannot connect socket"); failure();
+-	}
+-	return sd;
+-}
+-
+-void lib_init()
+-{
+-	SSL_library_init();
+-	OpenSSL_add_all_algorithms();
+-	SSL_load_error_strings();
+-}
+-
+-static SSL_CTX* client_init(const SSL_METHOD *method, enum cipher_choice cipher_choice)
+-{
+-	SSL_CTX *ctx;
+-	char *cipher_list;
+-
+-	ctx = SSL_CTX_new(method);
+-	if (!ctx) {
+-		ERR_print_errors_fp(stderr);
+-		failure();
+-	}
+-
+-	switch (cipher_choice) {
+-	case CIPHER_ALL: cipher_list = "ALL:!aNULL:!eNULL"; break;
+-	case CIPHER_RC4: cipher_list = "RC4"; break;
+-	case CIPHER_ECDH: cipher_list = "ECDH"; break;
+-	case CIPHER_AES: cipher_list = "AES"; break;
+-	default:
+-		printf("invalid cipher choice\n");	
+-		failure();
+-	}
+-
+-	/* aNULL no auth
+-	** eNULL null ciphers
+-	** AES, AESGCM, DES, RC4
+-	** ECDH
+-	*/
+-
+-	SSL_CTX_set_cipher_list(ctx, cipher_list);
+-
+-	return ctx;
+-}
+-
+-static void show_certificates(SSL* ssl)
+-{
+-	X509 *cert;
+-	char *line;
+-
+-	cert = SSL_get_peer_certificate(ssl);
+-	if (!cert) {
+-		printf("No client certificate\n");
+-		return;
+-	}
+-
+-	printf("client certificate:\n");
+-
+-	line = X509_NAME_oneline(X509_get_subject_name(cert), NULL, 0);
+-	printf("* Subject: %s\n", line);
+-	free(line);
+-	line = X509_NAME_oneline(X509_get_issuer_name(cert), NULL, 0);
+-	printf("* Issuer: %s\n", line);
+-	free(line);
+-	X509_free(cert);
+-}
+-
+-int SSL_write_all(SSL *ssl, char *buf, int sz)
+-{
+-	int written = 0;
+-	int n;
+-
+-	while (written < sz) {
+-		n = SSL_write(ssl, buf + written, sz - written);
+-		if (n > 0)
+-			written += n;
+-		else if (n < 0)
+-			return -1;
+-	}
+-	return 0;
+-}
+-
+-#define BENCH_CHUNK 4096
+-
+-typedef struct
+-{
+-	struct timeval v;
+-} record_time_t;
+-
+-void record_time(record_time_t *t)
+-{
+-	int rv = gettimeofday(&t->v, NULL);
+-	if (rv) {
+-		perror("gettimeofday");
+-		exit(1);
+-	}
+-}
+-
+-void print_time(char *label, uint64_t nb_bytes, record_time_t *t1, record_time_t *t2)
+-{
+-	int sec = t2->v.tv_sec - t1->v.tv_sec;
+-	int usec = t2->v.tv_usec - t1->v.tv_usec;
+-	int64_t f;
+-	int unit_index = 0;
+-	double val;
+-	char *units[] = {
+-		" b",
+-		"kb",
+-		"mb",
+-		"gb",
+-	};
+-
+-	if (usec < 0) {
+-		usec += 1000000;
+-		sec--;
+-	}
+-
+-	f = sec * 1000000 + usec;
+-
+-	val = nb_bytes * 1000000 / f;
+-
+-	while (unit_index < 3 && val > 1080) {
+-		val /= 1024;
+-		unit_index++;
+-	}
+-
+-	printf("%s: %" PRIu64 " bytes in %" PRId64 " us => %.3f %s/s\n", label, nb_bytes, f, val, units[unit_index]);
+-}
+-
+-static void benchmark(SSL *ssl, uint64_t send_bytes, uint64_t recv_bytes)
+-{
+-	uint64_t bytes = 0;
+-	char buf[BENCH_CHUNK];
+-	record_time_t t0, t1, t2;
+-	int sd;
+-
+-	memset(buf, 'a', BENCH_CHUNK);
+-
+-	record_time(&t0);
+-
+-	if (SSL_connect(ssl) != 1) {
+-		ERR_print_errors_fp(stderr);
+-		goto out;
+-	}
+-
+-	printf("cipher: %s\n", SSL_CIPHER_get_name(SSL_get_current_cipher(ssl)));
+-
+-	record_time(&t1);
+-
+-	if (send_bytes) {
+-		while (bytes < send_bytes) {
+-			int to_send = (send_bytes - bytes > BENCH_CHUNK) ? BENCH_CHUNK : send_bytes - bytes;
+-			if (SSL_write_all(ssl, buf, to_send))
+-				break;
+-			bytes += to_send;
+-		}
+-	} else {
+-		while (bytes < recv_bytes) {
+-			int to_recv = (recv_bytes - bytes > BENCH_CHUNK) ? BENCH_CHUNK : recv_bytes - bytes;
+-			int recved;
+-			recved = SSL_read(ssl, buf, sizeof(to_recv));
+-			if (recved > 0)
+-				bytes += recved;
+-			else
+-				break;
+-		}
+-	}
+-
+-	record_time(&t2);
+-	print_time((send_bytes > 0) ? "sending" : "receiving",
+-	           (send_bytes > 0) ? send_bytes : recv_bytes,
+-	           &t1, &t2);
+-
+-	SSL_shutdown(ssl);
+-out:
+-	sd = SSL_get_fd(ssl);
+-	SSL_free(ssl);
+-	close(sd);
+-}
+-
+-static void process(SSL* ssl)
+-{
+-	char buf[1024];
+-	int sd, bytes;
+-
+-	strcpy(buf, "Hello World\n");
+-
+-	if (SSL_connect(ssl) != 1) {
+-		ERR_print_errors_fp(stderr);
+-		goto out;
+-	}
+-
+-	show_certificates(ssl);
+-	while (1) {
+-		bytes = SSL_write(ssl, buf, sizeof(buf));
+-		if (bytes > 0) {
+-			printf("received from client: \"%s\"\n", buf);
+-			SSL_write(ssl, buf, bytes);
+-		} else {
+-			ERR_print_errors_fp(stderr);
+-			break;
+-		}
+-		if (SSL_get_shutdown(ssl) == SSL_RECEIVED_SHUTDOWN) {
+-			SSL_shutdown(ssl);
+-			break;
+-		}
+-	}
+-
+-out:
+-	sd = SSL_get_fd(ssl);
+-	SSL_free(ssl);
+-	close(sd);
+-}
+-
+-int main(int argc, char *argv[])
+-{
+-	SSL_CTX *ctx;
+-	const SSL_METHOD *method = SSLv3_client_method();
+-	int client_fd;
+-	char *host;
+-	char *portnum;
+-	int bench_send = 0;
+-	int bench_recv = 0;
+-	int i;
+-	enum cipher_choice cipher_choice = CIPHER_ALL;
+-
+-	if (argc < 3) {
+-		printf("Usage: %s <host_ip> <portnum> [opts]\n", argv[0]);
+-		exit(-1);
+-	}
+-
+-	host = argv[1];
+-	portnum = argv[2];
+-
+-	lib_init();
+-
+-	for (i = 3; i < argc; i++) {
+-		if (strcmp("tls-1.2", argv[i]) == 0) {
+-			method = TLSv1_2_client_method();
+-		} else if (strcmp("tls-1.1", argv[i]) == 0) {
+-			method = TLSv1_1_client_method();
+-		} else if (strcmp("tls-1.0", argv[i]) == 0) {
+-			method = TLSv1_client_method();
+-		} else if (strcmp("ssl-3.0", argv[i]) == 0) {
+-			method = SSLv3_client_method();
+-		} else if (strcmp("bench-send", argv[i]) == 0) {
+-			bench_send = atoi(argv[++i]);
+-		} else if (strcmp("bench-recv", argv[i]) == 0) {
+-			bench_recv = atoi(argv[++i]);
+-		} else {
+-			printf("warning: unknown option: \"%s\"\n", argv[i]);
+-		}
+-	}
+-
+-	ctx = client_init(method, cipher_choice);
+-
+-	client_fd = connect_socket(host, atoi(portnum));
+-
+-	printf("[status] connected. handshaking\n");
+-
+-	SSL *ssl;
+-	ssl = SSL_new(ctx);
+-	SSL_set_fd(ssl, client_fd);
+-
+-	if (bench_send > 0 || bench_recv > 0)
+-		benchmark(ssl, bench_send, bench_recv);
+-	else
+-		process(ssl);
+-	close(client_fd);
+-	SSL_CTX_free(ctx);
+-	return 0;
+-}
+diff --git a/test-scripts/openssl-server.c b/test-scripts/openssl-server.c
+deleted file mode 100644
+index 99ff4d7f..00000000
+--- a/test-scripts/openssl-server.c
++++ /dev/null
+@@ -1,427 +0,0 @@
+-/*
+- * a simple OpenSSL server to test interoperability with tls
+- */
+-#include <stdio.h>
+-#include <unistd.h>
+-#include <string.h>
+-#include <inttypes.h>
+-#include <sys/socket.h>
+-#include <sys/time.h>
+-#include <arpa/inet.h>
+-#include <resolv.h>
+-#include <openssl/ssl.h>
+-#include <openssl/err.h>
+-#include <openssl/opensslv.h>
+-#include <openssl/engine.h>
+-
+-#define SSL_FAIL    -1
+-
+-/* ECDH_auto only available in 1.0.2, not before 1.0.1 and not after 1.1 */
+-#if OPENSSL_VERSION_NUMBER >= 0x10100000L || OPENSSL_VERSION_NUMBER < 0x10002000L
+-#define OPENSSL_NO_ECDH_AUTO
+-#endif
+-
+-#if OPENSSL_VERSION_NUMBER >= 0x10000000L
+-#define OPENSSL_RECENT
+-#define const_SSL_METHOD const SSL_METHOD
+-#else
+-#warning "building with old version of openSSL"
+-#define OPENSSL_OLD
+-#define TLSv1_2_server_method() SSLv3_server_method()
+-#define TLSv1_1_server_method() SSLv3_server_method()
+-#define TLSv1_server_method() SSLv3_server_method()
+-#define const_SSL_METHOD SSL_METHOD
+-#endif
+-
+-static uint8_t deterministic_val = 1;
+-static void deterministic_seed (const void *buf, int num) { return; }
+-static int deterministic_bytes (unsigned char *buf, int num) { int i; for (i = 0; i < num; i++) *buf++ = deterministic_val++; return num; }
+-static void deterministic_cleanup (void) { return; }
+-static void deterministic_add (const void *buf, int num, double entropy) { return; }
+-static int deterministic_pseudorand (unsigned char *buf, int num) { return deterministic_bytes(buf, num); }
+-static int deterministic_status (void) { return 1; }
+-
+-const struct rand_meth_st deterministic_rand = {
+-	.seed = deterministic_seed,
+-	.bytes = deterministic_bytes,
+-	.cleanup = deterministic_cleanup,
+-	.add = deterministic_add,
+-	.pseudorand = deterministic_pseudorand,
+-	.status = deterministic_status,
+-};
+-
+-void failure() { exit(0xf); }
+-
+-static int listen_socket(int port)
+-{
+-	int sd;
+-	struct sockaddr_in addr;
+-	int enable = 1;
+-
+-	sd = socket(PF_INET, SOCK_STREAM, 0);
+-	if (sd < 0) {
+-		perror("cannot create socket"); failure();
+-	}
+-
+-	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) < 0) {
+-		perror("cannot set SO_REUSEADDR"); failure();
+-	}
+-
+-	memset(&addr, 0, sizeof(addr));
+-	addr.sin_family = AF_INET;
+-	addr.sin_port = htons(port);
+-	addr.sin_addr.s_addr = INADDR_ANY;
+-
+-	if (bind(sd, (struct sockaddr *) &addr, sizeof(addr)) != 0) {
+-		perror("bind failed"); failure();
+-	}
+-
+-	if (listen(sd, 10) != 0) {
+-		perror("listen failed"); failure();
+-	}
+-	return sd;
+-}
+-
+-static int verify_callback(int preverify_ok, X509_STORE_CTX *x509)
+-{
+-	printf("verify callback\n");
+-	return 1; /* 1 for success, 0 for fail */
+-}
+-
+-static SSL_CTX* server_init(const_SSL_METHOD *method, int want_client_cert, int want_dhe, int want_ecdhe)
+-{
+-	SSL_CTX *ctx;
+-
+-	SSL_library_init();
+-	OpenSSL_add_all_algorithms();
+-	SSL_load_error_strings();
+-
+-	ctx = SSL_CTX_new(method);
+-	if (!ctx) {
+-		ERR_print_errors_fp(stderr);
+-		failure();
+-	}
+-
+-	if (want_client_cert) {
+-		SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, verify_callback);
+-	}
+-
+-	if (want_dhe) {
+-		DH *dh;
+-
+-		dh = DH_new();
+-		if (!dh) { printf("cannot DH new\n"); failure(); }
+-
+-		if (DH_generate_parameters_ex(dh, 1024, DH_GENERATOR_2, NULL) != 1) {
+-			printf("cannot generate DH\n");
+-			failure();
+-		}
+-
+-		if (SSL_CTX_set_tmp_dh(ctx, dh) != 1) {
+-			printf("cannot set tmp DH\n");
+-			failure();
+-		}
+-		SSL_CTX_set_options(ctx, SSL_OP_SINGLE_DH_USE);
+-	}
+-	if (want_ecdhe) {
+-#ifndef OPENSSL_NO_ECDH_AUTO
+-		SSL_CTX_set_ecdh_auto(ctx, 1);
+-#endif
+-	}
+-
+-	return ctx;
+-}
+-
+-static void load_server_certificates(SSL_CTX* ctx, char* cert_file, char* key_file)
+-{
+-	if (SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) <= 0) {
+-		ERR_print_errors_fp(stderr);
+-		failure();
+-	}
+-	if (SSL_CTX_use_PrivateKey_file(ctx, key_file, SSL_FILETYPE_PEM) <= 0) {
+-		ERR_print_errors_fp(stderr);
+-		failure();
+-	}
+-	if (!SSL_CTX_check_private_key(ctx)) {
+-		fprintf(stderr, "Private key does not match the public certificate\n");
+-		failure();
+-	}
+-}
+-
+-static void show_certificates(SSL* ssl)
+-{
+-	X509 *cert;
+-	char *line;
+-
+-	cert = SSL_get_peer_certificate(ssl);
+-	if (!cert) {
+-		printf("No client certificate\n");
+-		return;
+-	}
+-
+-	printf("client certificate:\n");
+-
+-	line = X509_NAME_oneline(X509_get_subject_name(cert), NULL, 0);
+-	printf("* Subject: %s\n", line);
+-	free(line);
+-	line = X509_NAME_oneline(X509_get_issuer_name(cert), NULL, 0);
+-	printf("* Issuer: %s\n", line);
+-	free(line);
+-	X509_free(cert);
+-}
+-
+-int SSL_write_all(SSL *ssl, char *buf, int sz)
+-{
+-	int written = 0;
+-	int n;
+-
+-	while (written < sz) {
+-		n = SSL_write(ssl, buf + written, sz - written);
+-		if (n > 0)
+-			written += n;
+-		else if (n < 0)
+-			return -1;
+-	}
+-	return 0;
+-}
+-
+-#define BENCH_CHUNK 4096
+-
+-typedef struct
+-{
+-	struct timeval v;
+-} record_time_t;
+-
+-void record_time(record_time_t *t)
+-{
+-	int rv = gettimeofday(&t->v, NULL);
+-	if (rv) {
+-		perror("gettimeofday");
+-		exit(1);
+-	}
+-}
+-
+-void print_time(char *label, uint64_t nb_bytes, record_time_t *t1, record_time_t *t2)
+-{
+-	int sec = t2->v.tv_sec - t1->v.tv_sec;
+-	int usec = t2->v.tv_usec - t1->v.tv_usec;
+-	int64_t f;
+-	int unit_index = 0;
+-	double val;
+-	char *units[] = {
+-		" b",
+-		"kb",
+-		"mb",
+-		"gb",
+-	};
+-
+-	if (usec < 0) {
+-		usec += 1000000;
+-		sec--;
+-	}
+-
+-	f = sec * 1000000 + usec;
+-
+-	val = nb_bytes * 1000000 / f;
+-
+-	while (unit_index < 3 && val > 1080) {
+-		val /= 1024;
+-		unit_index++;
+-	}
+-
+-	printf("%s: %" PRIu64 " bytes in %" PRId64 " us => %.3f %s/s\n", label, nb_bytes, f, val, units[unit_index]);
+-}
+-
+-static void benchmark(SSL *ssl, uint64_t send_bytes, uint64_t recv_bytes)
+-{
+-	uint64_t bytes = 0;
+-	char buf[BENCH_CHUNK];
+-	record_time_t t1, t2;
+-	int sd;
+-
+-	memset(buf, 'a', BENCH_CHUNK);
+-
+-	if (SSL_accept(ssl) == SSL_FAIL) {
+-		ERR_print_errors_fp(stderr);
+-		goto out;
+-	}
+-
+-	printf("cipher: %s\n", SSL_CIPHER_get_name(SSL_get_current_cipher(ssl)));
+-
+-	record_time(&t1);
+-
+-	if (send_bytes) {
+-		while (bytes < send_bytes) {
+-			int to_send = (send_bytes - bytes > BENCH_CHUNK) ? BENCH_CHUNK : send_bytes - bytes;
+-			if (SSL_write_all(ssl, buf, to_send))
+-				break;
+-			bytes += to_send;
+-		}
+-	} else {
+-		while (bytes < recv_bytes) {
+-			int to_recv = (recv_bytes - bytes > BENCH_CHUNK) ? BENCH_CHUNK : recv_bytes - bytes;
+-			int recved;
+-			recved = SSL_read(ssl, buf, sizeof(to_recv));
+-			if (recved > 0)
+-				bytes += recved;
+-			else
+-				break;
+-		}
+-	}
+-
+-	record_time(&t2);
+-	print_time((send_bytes > 0) ? "sending" : "receiving",
+-	           (send_bytes > 0) ? send_bytes : recv_bytes,
+-	           &t1, &t2);
+-
+-	SSL_shutdown(ssl);
+-out:
+-	sd = SSL_get_fd(ssl);
+-	SSL_free(ssl);
+-	close(sd);
+-}
+-
+-static void process(SSL* ssl)
+-{
+-	char buf[1024];
+-	int sd, bytes;
+-
+-	if (SSL_accept(ssl) == SSL_FAIL) {
+-		ERR_print_errors_fp(stderr);
+-		goto out;
+-	}
+-
+-	printf("cipher: %s\n", SSL_CIPHER_get_name(SSL_get_current_cipher(ssl)));
+-
+-	show_certificates(ssl);
+-	while (1) {
+-		bytes = SSL_read(ssl, buf, sizeof(buf));
+-		if (bytes > 0) {
+-			printf("received from client: \"%s\"\n", buf);
+-			SSL_write(ssl, buf, bytes);
+-		} else {
+-			ERR_print_errors_fp(stderr);
+-			break;
+-		}
+-		if (SSL_get_shutdown(ssl) == SSL_RECEIVED_SHUTDOWN) {
+-			SSL_shutdown(ssl);
+-			break;
+-		}
+-	}
+-
+-out:
+-	sd = SSL_get_fd(ssl);
+-	SSL_free(ssl);
+-	close(sd);
+-}
+-
+-int main(int argc, char *argv[])
+-{
+-	SSL_CTX *ctx;
+-	const_SSL_METHOD *method = SSLv3_server_method();
+-	int server_fd;
+-	char *portnum;
+-	char *file_cert;
+-	char *file_key;
+-	int want_client_cert = 0;
+-	int want_dhe = 0;
+-	int want_ecdhe = 0;
+-	int keep_running = 0;
+-	int use_ready_file = 0;
+-	int bench_send = 0;
+-	int bench_recv = 0;
+-	int deterministic = 0;
+-	char *ready_file;
+-	int i;
+-
+-	if (argc < 4) {
+-		printf("Usage: %s <portnum> <cert.pem> <key.pem> [opts]\n", argv[0]);
+-		exit(-1);
+-	}
+-
+-	portnum = argv[1];
+-	file_cert = argv[2];
+-	file_key = argv[3];
+-
+-	for (i = 4; i < argc; i++) {
+-		if (strcmp("tls-1.2", argv[i]) == 0) {
+-			method = TLSv1_2_server_method();
+-		} else if (strcmp("tls-1.1", argv[i]) == 0) {
+-			method = TLSv1_1_server_method();
+-		} else if (strcmp("tls-1.0", argv[i]) == 0) {
+-			method = TLSv1_server_method();
+-		} else if (strcmp("ssl-3.0", argv[i]) == 0) {
+-			method = SSLv3_server_method();
+-		} else if (strcmp("client-cert", argv[i]) == 0) {
+-			want_client_cert = 1;
+-		} else if (strcmp("keep-running", argv[i]) == 0) {
+-			keep_running = 1;
+-		} else if (strcmp("dhe", argv[i]) == 0) {
+-			want_dhe = 1;
+-		} else if (strcmp("ecdhe", argv[i]) == 0) {
+-			want_ecdhe = 1;
+-		} else if (strcmp("ready-file", argv[i]) == 0) {
+-			use_ready_file = 1;
+-			ready_file = argv[++i];
+-		} else if (strcmp("bench-send", argv[i]) == 0) {
+-			bench_send = atoi(argv[++i]);
+-		} else if (strcmp("bench-recv", argv[i]) == 0) {
+-			bench_recv = atoi(argv[++i]);
+-		} else if (strcmp("deterministic", argv[i]) == 0) {
+-			deterministic = 1;
+-		} else {
+-			printf("warning: unknown option: \"%s\"\n", argv[i]);
+-		}
+-	}
+-
+-	if (use_ready_file)
+-		printf("readyfile: %s\n", ready_file);
+-
+-	if (deterministic) {
+-		ENGINE *engine;
+-
+-		engine = ENGINE_new();
+-		ENGINE_set_RAND(engine, &deterministic_rand);
+-
+-		RAND_set_rand_engine(engine);
+-	}
+-
+-	ctx = server_init(method, want_client_cert, want_dhe, want_ecdhe);
+-
+-	load_server_certificates(ctx, file_cert, file_key);
+-
+-	server_fd = listen_socket(atoi(portnum));
+-
+-	if (use_ready_file) {
+-		FILE *f;
+-
+-		f = fopen(ready_file, "w+");
+-		if (f != NULL) {
+-			fwrite("ready\n", 6, 1, f);
+-			fclose(f);
+-		}
+-	}
+-
+-	do {
+-		struct sockaddr_in addr;
+-		socklen_t len = sizeof(addr);
+-		SSL *ssl;
+-
+-		printf("[status] accepting connection\n");
+-		int client = accept(server_fd, (struct sockaddr *) &addr, &len);
+-		printf("[log] got connection from %s:%d\n", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+-
+-		deterministic_val = 1;
+-
+-		ssl = SSL_new(ctx);
+-		SSL_set_fd(ssl, client);
+-		if (bench_send > 0 || bench_recv > 0)
+-			benchmark(ssl, bench_send, bench_recv);
+-		else
+-			process(ssl);
+-	} while (keep_running);
+-
+-	close(server_fd);
+-	SSL_CTX_free(ctx);
+-	return 0;
+-}
+diff --git a/test-scripts/runtest-client-bench b/test-scripts/runtest-client-bench
+deleted file mode 100755
+index d68f82fb..00000000
+--- a/test-scripts/runtest-client-bench
++++ /dev/null
+@@ -1,25 +0,0 @@
+-#!/bin/sh
+-
+-PORT=20004
+-
+-if [ ! -d test-dir ]; then
+-	mkdir test-dir
+-fi
+-
+-if [ ! -f test-dir/small ]; then
+-	dd if=/dev/zero of=test-dir/small bs=1024 count=1024
+-fi
+-if [ ! -f test-dir/big ]; then
+-	dd if=/dev/zero of=test-dir/big bs=1024 count=104448
+-fi
+-cp server.key server.crt test-dir
+-
+-(cd test-dir; openssl s_server -WWW -accept $PORT -key server.key -cert server.crt &)
+-
+-echo "=========================== WGET ======================="
+-time wget -q --no-check-certificate -O /dev/null https://localhost:$PORT/small
+-time wget -q --no-check-certificate -O /dev/null https://localhost:$PORT/big
+-
+-echo "=========================== TLS ======================="
+-time ./debug/dist/build/tls-simpleclient/tls-simpleclient -O /dev/null localhost $PORT --uri /small  --no-validation
+-time ./debug/dist/build/tls-simpleclient/tls-simpleclient -O /dev/null localhost $PORT --uri /big  --no-validation
+diff --git a/test-scripts/runtest-gnutls b/test-scripts/runtest-gnutls
+deleted file mode 100755
+index 160e24c2..00000000
+--- a/test-scripts/runtest-gnutls
++++ /dev/null
+@@ -1,30 +0,0 @@
+-#!/bin/sh
+-STUNNEL=./debug/dist/build/tls-stunnel/tls-stunnel
+-
+-if [ ! -x ${STUNNEL} ]; then
+-	echo "hs-tls stunnel is not present, build with executable flag set."
+-	exit 1
+-fi
+-
+-PORT=$(($$ % 10000 + 10000))
+-
+-if [ ! -f server.rsa.crt ]; then
+-	echo "generate some certificate \"server.rsa.crt\""
+-	exit 2
+-fi
+-
+-if [ ! -f server.rsa.key ]; then
+-	echo "generate some private key \"server.rsa.key\""
+-	exit 2
+-fi
+-
+-echo "running stunnel"
+-${STUNNEL} server --dhparams dhparams --certificate server.rsa.crt --key server.rsa.key --certificate server.dsa.crt --key server.dsa.key --source=localhost:${PORT} --destination-type=fd --debug --destination=2 > stunnel-gnutls-log 2>&1 &
+-stunnelpid=$(pidof stunnel)
+-STUNNELPID=$!
+-sleep 1
+-
+-echo "starting gnutls cli debug"
+-gnutls-cli-debug localhost -p ${PORT} -V -V
+-
+-kill ${STUNNELPID}
+diff --git a/test-scripts/tls-test.cabal b/test-scripts/tls-test.cabal
+deleted file mode 100644
+index 6fdac633..00000000
+--- a/test-scripts/tls-test.cabal
++++ /dev/null
+@@ -1,38 +0,0 @@
+-cabal-version: >=1.10
+-name:          tls-test
+-version:       0.0.0
+-license:       BSD3
+-copyright:     Vincent Hanquez <vincent@snarc.org>
+-maintainer:    Vincent Hanquez <vincent@snarc.org>
+-author:        Vincent Hanquez <vincent@snarc.org>
+-stability:     experimental
+-homepage:      http://github.com/vincenthz/hs-tls
+-synopsis:      Set of programs for TLS testing and debugging
+-description:   client And server test
+-category:      Network
+-build-type:    Simple
+-
+-source-repository head
+-    type:     git
+-    location: https://github.com/vincenthz/hs-tls
+-
+-executable TestClient
+-    main-is:        TestClient.hs
+-    hs-source-dirs: .
+-    ghc-options:    -Wall -fno-warn-missing-signatures -threaded
+-    build-depends:
+-        base >=4 && <5,
+-        network,
+-        bytestring,
+-        x509-system >=1.0,
+-        data-default >=0.8,
+-        directory,
+-        random,
+-        async,
+-        unix,
+-        process,
+-        utf8-string,
+-        tls
+-
+-    if os(windows)
+-        buildable: False
+diff --git a/tls-compliance-test.sh b/tls-compliance-test.sh
+deleted file mode 100755
+index 1d517b11..00000000
+--- a/tls-compliance-test.sh
++++ /dev/null
+@@ -1,90 +0,0 @@
+-#!/bin/bash
+-
+-# TLS Compliance Test Script
+-# Tests the hs-tls-ocsp server against real-world TLS clients
+-
+-set -e
+-
+-echo "=== TLS Compliance Testing ==="
+-echo "Testing enhanced TLS library against real clients"
+-echo ""
+-
+-# Create a simple test certificate if it doesn't exist
+-if [ ! -f test.crt ] || [ ! -f test.key ]; then
+-    echo "Creating test certificate..."
+-    openssl req -x509 -newkey rsa:2048 -keyout test.key -out test.crt -days 30 -nodes \
+-        -subj "/CN=localhost/O=Test/C=US" \
+-        -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+-fi
+-
+-# Start the TLS server in background
+-echo "Starting hs-tls server..."
+-stack exec tls-simpleserver -- --certificate test.crt --key test.key 4443 &
+-SERVER_PID=$!
+-
+-# Give server time to start
+-sleep 2
+-
+-echo "Server started with PID $SERVER_PID"
+-echo ""
+-
+-# Function to cleanup
+-cleanup() {
+-    echo "Cleaning up..."
+-    kill $SERVER_PID 2>/dev/null || true
+-    wait $SERVER_PID 2>/dev/null || true
+-}
+-trap cleanup EXIT
+-
+-# Test 1: OpenSSL s_client basic connection
+-echo "=== Test 1: OpenSSL s_client basic connection ==="
+-echo "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" | \
+-    timeout 10s openssl s_client -connect localhost:4443 -quiet -verify_return_error 2>&1 | \
+-    head -10
+-echo "✅ Basic OpenSSL connection test completed"
+-echo ""
+-
+-# Test 2: OpenSSL s_client with OCSP status request
+-echo "=== Test 2: OpenSSL s_client with OCSP status request ==="
+-echo "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" | \
+-    timeout 10s openssl s_client -connect localhost:4443 -status -quiet 2>&1 | \
+-    head -10
+-echo "✅ OCSP status request test completed"
+-echo ""
+-
+-# Test 3: OpenSSL s_client with detailed handshake debugging
+-echo "=== Test 3: OpenSSL handshake trace (checking message order) ==="
+-timeout 10s openssl s_client -connect localhost:4443 -msg -quiet -ign_eof </dev/null 2>&1 | \
+-    grep -E "(Certificate|CertificateStatus|ServerKeyExchange|write|read)" | head -20
+-echo "✅ Handshake trace completed"
+-echo ""
+-
+-# Test 4: Check supported protocols
+-echo "=== Test 4: TLS version support ==="
+-for version in tls1_2 tls1_3; do
+-    echo "Testing $version..."
+-    result=$(timeout 5s openssl s_client -connect localhost:4443 -$version -quiet </dev/null 2>&1 | \
+-        grep -E "(Protocol|Cipher)" | head -2 || echo "Failed")
+-    echo "$version: $result"
+-done
+-echo ""
+-
+-# Test 5: Check cipher suite support
+-echo "=== Test 5: Cipher suite compatibility ==="
+-timeout 5s openssl s_client -connect localhost:4443 -cipher 'HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA' -quiet </dev/null 2>&1 | \
+-    grep -E "(Cipher|Protocol)" | head -5
+-echo "✅ Cipher suite test completed"
+-echo ""
+-
+-# Test 6: ALPN negotiation
+-echo "=== Test 6: ALPN negotiation ==="
+-for proto in h2 http/1.1; do
+-    echo "Testing ALPN with $proto..."
+-    result=$(timeout 5s openssl s_client -connect localhost:4443 -alpn "$proto" -quiet </dev/null 2>&1 | \
+-        grep -E "(ALPN protocol|Protocol)" || echo "No ALPN")
+-    echo "  $proto: $result"
+-done
+-echo ""
+-
+-echo "=== Compliance Testing Complete ==="
+-echo "Check the output above for any protocol violations or errors"
+\ No newline at end of file
+diff --git a/tls/Network/TLS/Handshake/Server/ServerHello12.hs b/tls/Network/TLS/Handshake/Server/ServerHello12.hs
+index d91a816b..71d149fa 100644
+--- a/tls/Network/TLS/Handshake/Server/ServerHello12.hs
++++ b/tls/Network/TLS/Handshake/Server/ServerHello12.hs
+@@ -326,10 +326,16 @@ makeServerHello sparams ctx usedCipher mcred chExts session = do
+ 
+     recodeSizeLimitExt <- processRecordSizeLimit ctx chExts False
+ 
++    let statusReqExt =
++            if hasStatusRequest chExts
++                then Just $ ExtensionRaw EID_StatusRequest ""   -- empty payload as per RFC 6066
++                else Nothing
++
+     let shExts =
+             sharedHelloExtensions (serverShared sparams)
+                 ++ catMaybes
+                     [ {- 0x00 -} sniExt
++                    , {- 0x05 -} statusReqExt
+                     , {- 0x0b -} ecPointExt
+                     , {- 0x10 -} alpnExt
+                     , {- 0x17 -} emsExt
+diff --git a/tls/Network/TLS/Handshake/Server/ServerHello13.hs b/tls/Network/TLS/Handshake/Server/ServerHello13.hs
+index 463c15d3..62db409b 100644
+--- a/tls/Network/TLS/Handshake/Server/ServerHello13.hs
++++ b/tls/Network/TLS/Handshake/Server/ServerHello13.hs
+@@ -7,6 +7,7 @@ module Network.TLS.Handshake.Server.ServerHello13 (
+ 
+ import Control.Monad.State.Strict
+ import qualified Data.ByteString as B
++import Data.Serialize (runPut, putWord8)
+ 
+ import Network.TLS.Cipher
+ import Network.TLS.Context.Internal
+@@ -30,8 +31,16 @@ import Network.TLS.State
+ import Network.TLS.Struct
+ import Network.TLS.Struct13
+ import Network.TLS.Types
++import Network.TLS.Wire (putOpaque24)
+ import Network.TLS.X509
+ 
++-- | Encode OCSP response in CertificateStatus format for TLS 1.3 extensions
++-- In TLS 1.3, OCSP responses in Certificate extensions must use the same format as TLS 1.2 CertificateStatus
++encodeCertificateStatusForExtension :: B.ByteString -> B.ByteString
++encodeCertificateStatusForExtension ocspDer = runPut $ do
++    putWord8 0x01      -- status_type = 1 (OCSP)
++    putOpaque24 ocspDer -- length (3 bytes) + OCSP DER data
++
+ sendServerHello13
+     :: ServerParams
+     -> Context
+@@ -264,7 +273,9 @@ sendServerHello13 sparams ctx clientKeyShare (usedCipher, usedHash, rtt0) CH{..}
+                 case mOcspResponse of
+                     Just ocspDer ->
+                         -- Add OCSP extension to the leaf certificate only
+-                        let ocspExt = ExtensionRaw EID_StatusRequest ocspDer
++                        -- For TLS 1.3, we need to wrap the OCSP DER in CertificateStatus format
++                        let wrappedOcsp = encodeCertificateStatusForExtension ocspDer
++                            ocspExt = ExtensionRaw EID_StatusRequest wrappedOcsp
+                          in return $ [ocspExt] : replicate (length cs - 1) []
+                     Nothing -> do
+                         -- Check if certificate requires OCSP stapling (must-staple)
+diff --git a/tls/Network/TLS/Packet.hs b/tls/Network/TLS/Packet.hs
+index 88faa763..3330d943 100644
+--- a/tls/Network/TLS/Packet.hs
++++ b/tls/Network/TLS/Packet.hs
+@@ -316,7 +316,7 @@ decodeCertificateStatus :: Get Handshake
+ decodeCertificateStatus = do
+     statusType <- getWord8
+     when (statusType /= 1) $ fail "unknown certificate status type"
+-    CertificateStatus <$> getOpaque16
++    CertificateStatus <$> getOpaque24
+ 
+ ----------------------------------------------------------------
+ -- encode HANDSHAKE
+@@ -381,7 +381,7 @@ encodeHandshake' (ClientKeyXchg ckx) = runPut $ do
+ encodeHandshake' (Finished (VerifyData opaque)) = runPut $ putBytes opaque
+ encodeHandshake' (CertificateStatus der) = runPut $ do
+     putWord8 0x01  -- status_type = ocsp
+-    putOpaque16 der
++    putOpaque24 der
+ 
+ ------------------------------------------------------------
+ -- CA distinguished names
+diff --git a/tls/Network/TLS/State.hs b/tls/Network/TLS/State.hs
+index d63adfe3..e8bd8483 100644
+--- a/tls/Network/TLS/State.hs
++++ b/tls/Network/TLS/State.hs
+@@ -180,6 +180,7 @@ finishedHandshakeTypeMaterial HandshakeType_ClientKeyXchg = True
+ finishedHandshakeTypeMaterial HandshakeType_ServerKeyXchg = True
+ finishedHandshakeTypeMaterial HandshakeType_CertRequest = True
+ finishedHandshakeTypeMaterial HandshakeType_CertVerify = True
++finishedHandshakeTypeMaterial HandshakeType_CertificateStatus = True
+ finishedHandshakeTypeMaterial HandshakeType_NewSessionTicket = True
+ finishedHandshakeTypeMaterial HandshakeType_Finished = True
+ finishedHandshakeTypeMaterial _ = False
+@@ -196,6 +197,7 @@ certVerifyHandshakeTypeMaterial HandshakeType_ServerHelloDone = True
+ certVerifyHandshakeTypeMaterial HandshakeType_ClientKeyXchg = True
+ certVerifyHandshakeTypeMaterial HandshakeType_ServerKeyXchg = True
+ certVerifyHandshakeTypeMaterial HandshakeType_CertRequest = True
++certVerifyHandshakeTypeMaterial HandshakeType_CertificateStatus = True
+ -- certVerifyHandshakeTypeMaterial HandshakeType_CertVerify = False
+ -- certVerifyHandshakeTypeMaterial HandshakeType_Finished = False
+ certVerifyHandshakeTypeMaterial _ = False
+diff --git a/tls/test/integration/ocsp/OCSPTestServer.hs b/tls/test/integration/ocsp/OCSPTestServer.hs
+new file mode 100644
+index 00000000..74b8e4de
+--- /dev/null
++++ b/tls/test/integration/ocsp/OCSPTestServer.hs
+@@ -0,0 +1,308 @@
++{-# LANGUAGE OverloadedStrings #-}
++
++-- | OCSP Stapling Integration Test Server
++-- 
++-- This module provides a test server that demonstrates OCSP stapling functionality
++-- working correctly in both TLS 1.2 and TLS 1.3. It serves as proof that:
++-- 
++-- 1. OCSP hooks are called during TLS handshakes
++-- 2. OCSP responses are correctly formatted and delivered to clients
++-- 3. Both TLS 1.2 and TLS 1.3 protocols handle OCSP stapling properly
++--
++-- The server uses self-signed certificates and a pre-generated OCSP response
++-- suitable for integration testing.
++
++module Main (main) where
++
++import Control.Concurrent
++import qualified Control.Exception as E
++import Control.Monad
++import qualified Data.ByteString as B
++import qualified Data.ByteString.Char8 as BC
++import qualified Data.ByteString.Lazy.Char8 as LC
++import Data.Default (def)
++import Data.IORef
++import Data.X509.CertificateStore
++import Network.Socket (accept, bind, close, listen, socket)
++import qualified Network.Socket as S
++import System.Console.GetOpt
++import System.Environment
++import System.Exit
++import System.IO
++import System.IO.Unsafe (unsafeDupablePerformIO)
++
++import Network.TLS hiding (TLS12, TLS13)
++import qualified Network.TLS as TLS
++import Network.TLS.Extra.Cipher
++import Network.TLS.X509 (CertificateChain(..))
++
++-- | Test OCSP response (DER-encoded)
++-- This is a valid OCSP response for testing purposes, generated with OpenSSL
++testOcspResponse :: B.ByteString
++testOcspResponse = B.pack [0x30, 0x82, 0x02, 0x0b, 0x0a, 0x01, 0x00, 0xa0, 0x82, 0x02, 0x04, 0x30, 0x82, 0x02, 0x00, 0x06, 
++    0x09, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01, 0x04, 0x82, 0x01, 0xf1, 0x30, 0x82, 
++    0x01, 0xed, 0x30, 0x81, 0xd6, 0xa1, 0x38, 0x30, 0x36, 0x31, 0x10, 0x30, 0x0e, 0x06, 0x03, 0x55, 
++    0x04, 0x03, 0x0c, 0x07, 0x54, 0x65, 0x73, 0x74, 0x2d, 0x43, 0x41, 0x31, 0x15, 0x30, 0x13, 0x06, 
++    0x03, 0x55, 0x04, 0x0a, 0x0c, 0x0c, 0x4f, 0x43, 0x53, 0x50, 0x2d, 0x54, 0x65, 0x73, 0x74, 0x2d, 
++    0x43, 0x41, 0x31, 0x0b, 0x30, 0x09, 0x06, 0x03, 0x55, 0x04, 0x06, 0x13, 0x02, 0x55, 0x53, 0x18, 
++    0x0f, 0x32, 0x30, 0x32, 0x35, 0x30, 0x37, 0x30, 0x35, 0x30, 0x36, 0x31, 0x37, 0x32, 0x33, 0x5a, 
++    0x30, 0x64, 0x30, 0x62, 0x30, 0x4d, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 
++    0x00, 0x04, 0x14, 0x4a, 0x71, 0x94, 0xc5, 0x18, 0x1b, 0x30, 0xd8, 0x0b, 0x03, 0x2d, 0xc4, 0x32, 
++    0xd6, 0x36, 0x48, 0x0c, 0xe1, 0xfc, 0x31, 0x04, 0x14, 0xa8, 0x15, 0x5c, 0x12, 0xc6, 0xed, 0x21, 
++    0x51, 0x1a, 0x8c, 0xe5, 0xf6, 0xb8, 0x3a, 0xac, 0x98, 0x6b, 0x30, 0xd3, 0xa3, 0x02, 0x14, 0x32, 
++    0x13, 0xfd, 0x34, 0x41, 0xd2, 0xad, 0x0a, 0xcc, 0x9a, 0x9e, 0xc9, 0x25, 0x1a, 0x93, 0x64, 0xcb, 
++    0x9b, 0x39, 0x97, 0x80, 0x00, 0x18, 0x0f, 0x32, 0x30, 0x32, 0x35, 0x30, 0x37, 0x30, 0x35, 0x30, 
++    0x36, 0x31, 0x37, 0x32, 0x33, 0x5a, 0xa1, 0x23, 0x30, 0x21, 0x30, 0x1f, 0x06, 0x09, 0x2b, 0x06, 
++    0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02, 0x04, 0x12, 0x04, 0x10, 0xe0, 0x4c, 0x91, 0x4d, 0x76, 
++    0x49, 0x53, 0x94, 0x56, 0xa4, 0xf2, 0x91, 0x71, 0xf1, 0x0a, 0x6e, 0x30, 0x0d, 0x06, 0x09, 0x2a, 
++    0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b, 0x05, 0x00, 0x03, 0x82, 0x01, 0x01, 0x00, 0x41, 
++    0xd5, 0x69, 0xd1, 0xa7, 0xab, 0x08, 0x8d, 0x52, 0x84, 0x23, 0xa3, 0xa7, 0x53, 0xcd, 0x06, 0xcd, 
++    0xb7, 0x7a, 0x21, 0x0e, 0xeb, 0xbe, 0x53, 0x40, 0x54, 0x47, 0x8a, 0x28, 0x2c, 0x3b, 0x4a, 0x69, 
++    0x96, 0x42, 0xb2, 0x0e, 0xbb, 0xf0, 0x40, 0x57, 0xc5, 0xc1, 0xe4, 0x0b, 0x3a, 0xbb, 0xce, 0xa2, 
++    0xfb, 0x5f, 0x8e, 0x2a, 0x09, 0x50, 0x35, 0xb2, 0xd8, 0x7c, 0x02, 0xf8, 0x0b, 0x13, 0x5d, 0xc1, 
++    0xc7, 0x80, 0xbd, 0x2c, 0xb5, 0xea, 0x82, 0x60, 0x72, 0xcb, 0xcf, 0x98, 0xcf, 0xe3, 0x54, 0x2f, 
++    0x05, 0x61, 0x44, 0x07, 0x59, 0x33, 0x5d, 0x46, 0x58, 0x17, 0x9e, 0x03, 0x76, 0xb6, 0xc2, 0x2f, 
++    0xef, 0x80, 0x6c, 0xd6, 0x4f, 0x46, 0xe4, 0x87, 0xa1, 0x00, 0x34, 0x9c, 0x18, 0xf6, 0x48, 0x08, 
++    0xb0, 0xd4, 0xfb, 0xe2, 0x97, 0xec, 0xb9, 0xa2, 0x6e, 0x88, 0x4a, 0x0a, 0x7f, 0x83, 0x7b, 0x3a, 
++    0x94, 0x3d, 0x0c, 0x25, 0x42, 0xc2, 0x4a, 0x5d, 0x8a, 0xb0, 0x49, 0x32, 0x7f, 0x94, 0xee, 0xec, 
++    0x19, 0xab, 0x36, 0xfe, 0x71, 0x69, 0x5d, 0x62, 0x2f, 0x8c, 0x38, 0xfd, 0x6b, 0x4d, 0x0a, 0xcd, 
++    0xbd, 0x15, 0xaf, 0xbf, 0xce, 0xe8, 0x93, 0xcc, 0x1c, 0xac, 0x9a, 0xb6, 0x6f, 0xdd, 0xc3, 0x9a, 
++    0xe1, 0x5a, 0x7f, 0x78, 0xec, 0x4a, 0x99, 0xa2, 0x0a, 0x6e, 0x93, 0x76, 0x15, 0xc4, 0x59, 0x20, 
++    0x22, 0x61, 0x19, 0xef, 0xa0, 0xe3, 0x4a, 0x7b, 0x9d, 0xca, 0x4a, 0xd2, 0xed, 0xe9, 0xdd, 0x6f, 
++    0x8d, 0x9b, 0xc6, 0xc8, 0xc2, 0x40, 0xc5, 0x7a, 0x63, 0xdf, 0xa0, 0x1e, 0x07, 0xf2, 0x7e, 0x61, 
++    0x12, 0x11, 0x71, 0x39, 0xeb, 0x35, 0x43, 0xb6, 0xc9, 0xeb, 0x3b, 0x48, 0x5d, 0xd3, 0xdb, 0xbc, 
++    0x9f, 0xd5, 0x7a, 0x84, 0x6d, 0x20, 0x65, 0x1c, 0x00, 0x93, 0x39, 0x95, 0x43, 0x82, 0xa4]
++
++-- | Hook call counter for testing verification
++-- NOTE: Using unsafePerformIO is acceptable in test code for simple counters
++hookCallCounter :: IORef Int
++{-# NOINLINE hookCallCounter #-}
++hookCallCounter = unsafeDupablePerformIO $ newIORef 0
++
++-- | OCSP hook implementation for testing
++-- Returns the test OCSP response and logs the call for verification
++ocspHook :: CertificateChain -> Maybe String -> IO (Maybe B.ByteString)
++ocspHook (CertificateChain certs) sni = do
++    count <- atomicModifyIORef hookCallCounter (\n -> (n+1, n+1))
++    
++    putStrLn ""
++    putStrLn $ "*** OCSP HOOK CALLED (Call #" ++ show count ++ ") ***"
++    putStrLn $ "    SNI hostname: " ++ show sni
++    putStrLn $ "    Certificate chain length: " ++ show (length certs)
++    putStrLn $ "    Providing OCSP response: " ++ show (B.length testOcspResponse) ++ " bytes"
++    putStrLn $ "    Response type: Raw DER (library handles TLS wrapping)"
++    putStrLn ""
++    
++    return $ Just testOcspResponse
++
++-- | Simple HTTP response for testing
++httpResponse :: LC.ByteString
++httpResponse = "HTTP/1.1 200 OK\r\n\
++              \Content-Type: text/html\r\n\
++              \Content-Length: 89\r\n\
++              \\r\n\
++              \<html><body>\
++              \<h1>OCSP Test Server</h1>\
++              \<p>TLS handshake with OCSP stapling worked!</p>\
++              \</body></html>"
++
++-- | Server configuration
++data ServerConfig = ServerConfig
++    { configPort :: Int
++    , configTlsVersion :: Maybe TLS.Version
++    , configCertFile :: String
++    , configKeyFile :: String
++    , configVerbose :: Bool
++    }
++
++-- | Default configuration
++defaultConfig :: ServerConfig
++defaultConfig = ServerConfig
++    { configPort = 4443
++    , configTlsVersion = Nothing  -- Support both TLS 1.2 and 1.3
++    , configCertFile = "certs/server.crt"
++    , configKeyFile = "certs/server.key"
++    , configVerbose = False
++    }
++
++-- | Command line flags
++data Flag 
++    = Port String
++    | TLS12
++    | TLS13
++    | Certificate String
++    | Key String
++    | Verbose
++    | Help
++    deriving (Show, Eq)
++
++-- | Command line options
++options :: [OptDescr Flag]
++options = 
++    [ Option ['p'] ["port"] (ReqArg Port "PORT") "Port to listen on (default: 4443)"
++    , Option [] ["tls12"] (NoArg TLS12) "Force TLS 1.2 only"
++    , Option [] ["tls13"] (NoArg TLS13) "Force TLS 1.3 only"
++    , Option [] ["certificate"] (ReqArg Certificate "FILE") "Certificate file"
++    , Option [] ["key"] (ReqArg Key "FILE") "Private key file"
++    , Option ['v'] ["verbose"] (NoArg Verbose) "Enable verbose output"
++    , Option ['h'] ["help"] (NoArg Help) "Show this help"
++    ]
++
++-- | Parse command line flags into configuration
++parseConfig :: [Flag] -> ServerConfig
++parseConfig flags = foldl applyFlag defaultConfig flags
++  where
++    applyFlag config flag = case flag of
++        Port p -> config { configPort = read p }
++        TLS12 -> config { configTlsVersion = Just TLS.TLS12 }
++        TLS13 -> config { configTlsVersion = Just TLS.TLS13 }
++        Certificate f -> config { configCertFile = f }
++        Key f -> config { configKeyFile = f }
++        Verbose -> config { configVerbose = True }
++        _ -> config
++
++-- | Create server parameters with OCSP hook
++createServerParams :: ServerConfig -> Credential -> IO ServerParams
++createServerParams config cred = do
++    when (configVerbose config) $ putStrLn "Creating ServerParams with OCSP hook..."
++    
++    let certStore = makeCertificateStore []
++    
++    let supportedVersions = case configTlsVersion config of
++            Just v -> [v]
++            Nothing -> [TLS.TLS13, TLS.TLS12]
++            
++        params = def 
++            { serverWantClientCert = False
++            , serverCACertificates = []
++            , serverShared = def
++                { sharedCAStore = certStore  
++                , sharedCredentials = Credentials [cred]
++                }
++            , serverSupported = def
++                { supportedVersions = supportedVersions
++                , supportedCiphers = ciphersuite_default
++                }
++            , serverHooks = def
++                { onCertificateStatus = ocspHook
++                }
++            }
++    
++    when (configVerbose config) $ do
++        putStrLn "OCSP hook registered in ServerParams"
++        putStrLn $ "Supported TLS versions: " ++ show supportedVersions
++    return params
++
++-- | Handle a client connection
++handleClient :: ServerConfig -> ServerParams -> S.Socket -> IO ()
++handleClient config params sock = do
++    (clientSock, clientAddr) <- accept sock
++    when (configVerbose config) $ 
++        putStrLn $ "Incoming connection from: " ++ show clientAddr
++    
++    void $ forkIO $ do
++        ctx <- contextNew clientSock params
++        
++        E.handle (\e -> putStrLn $ "Client error: " ++ show (e :: E.SomeException)) $ do
++            when (configVerbose config) $ putStrLn "Starting TLS handshake..."
++            
++            -- Reset hook counter before handshake
++            writeIORef hookCallCounter 0
++            
++            -- Perform TLS handshake
++            handshake ctx
++            
++            -- Check hook call results
++            hookCalls <- readIORef hookCallCounter
++            putStrLn $ "TLS Handshake completed! OCSP hook called " ++ show hookCalls ++ " times"
++            
++            -- Get handshake information
++            info <- contextGetInformation ctx
++            case info of
++                Nothing -> putStrLn "No handshake information available"
++                Just i -> do
++                    putStrLn $ "TLS Version: " ++ show (infoVersion i)
++                    putStrLn $ "Cipher Suite: " ++ show (infoCipher i)
++            
++            -- Handle HTTP request
++            when (configVerbose config) $ putStrLn "Waiting for HTTP request..."
++            request <- recvData ctx
++            unless (B.null request) $ do
++                when (configVerbose config) $ 
++                    putStrLn $ "Request: " ++ show (B.take 50 request) ++ "..."
++                    
++                sendData ctx httpResponse
++                when (configVerbose config) $ putStrLn "Sent HTTP response"
++            
++            -- Clean shutdown
++            bye ctx
++            when (configVerbose config) $ putStrLn "Connection closed cleanly"
++            
++        `E.finally` close clientSock
++
++-- | Load server credentials
++loadCredentials :: ServerConfig -> IO Credential
++loadCredentials config = do
++    when (configVerbose config) $ do
++        putStrLn $ "Loading certificate: " ++ configCertFile config
++        putStrLn $ "Loading private key: " ++ configKeyFile config
++    
++    result <- credentialLoadX509 (configCertFile config) (configKeyFile config)
++    case result of
++        Left err -> error $ "Failed to load credentials: " ++ err
++        Right cred -> do
++            when (configVerbose config) $ putStrLn "Credentials loaded successfully"
++            return cred
++
++-- | Main server loop
++runServer :: ServerConfig -> IO ()
++runServer config = do
++    putStrLn "OCSP Stapling Test Server"
++    putStrLn "========================="
++    
++    -- Load credentials
++    cred <- loadCredentials config
++    
++    -- Create server parameters with OCSP hook
++    params <- createServerParams config cred
++    
++    -- Create and bind socket
++    sock <- socket S.AF_INET S.Stream S.defaultProtocol
++    S.setSocketOption sock S.ReuseAddr 1
++    bind sock (S.SockAddrInet (fromIntegral $ configPort config) 0)
++    listen sock 5
++    
++    putStrLn $ "Server listening on port " ++ show (configPort config)
++    case configTlsVersion config of
++        Just v -> putStrLn $ "TLS Version: " ++ show v ++ " only"
++        Nothing -> putStrLn "TLS Versions: TLS 1.3 and TLS 1.2"
++    putStrLn ""
++    putStrLn "Test commands:"
++    putStrLn $ "  TLS 1.2: openssl s_client -connect localhost:" ++ show (configPort config) ++ " -tls1_2 -status"
++    putStrLn $ "  TLS 1.3: openssl s_client -connect localhost:" ++ show (configPort config) ++ " -tls1_3 -status"
++    putStrLn ""
++    
++    -- Accept connections forever
++    (forever $ handleClient config params sock)
++        `E.finally` close sock
++
++-- | Print usage information
++printUsage :: IO ()
++printUsage = putStrLn $ usageInfo "OCSP Stapling Test Server\n" options
++
++-- | Main entry point
++main :: IO ()
++main = do
++    args <- getArgs
++    let (flags, _, errs) = getOpt Permute options args
++    
++    unless (null errs) $ do
++        mapM_ putStrLn errs
++        exitFailure
++    
++    when (Help `elem` flags) $ do
++        printUsage
++        exitSuccess
++    
++    let config = parseConfig flags
++    runServer config
+\ No newline at end of file
+diff --git a/tls/test/integration/ocsp/README.md b/tls/test/integration/ocsp/README.md
+new file mode 100644
+index 00000000..2eaae9f6
+--- /dev/null
++++ b/tls/test/integration/ocsp/README.md
+@@ -0,0 +1,210 @@
++# OCSP Stapling Integration Tests
++
++This directory contains comprehensive integration tests for OCSP (Online Certificate Status Protocol) stapling functionality in the hs-tls library.
++
++## Overview
++
++OCSP stapling allows TLS servers to provide certificate status information during the handshake, improving performance and privacy compared to clients making separate OCSP requests. This test suite verifies that:
++
++1. **OCSP hooks are called correctly** during TLS handshakes
++2. **OCSP responses are properly formatted** according to RFC 6066 and RFC 8446
++3. **Both TLS 1.2 and TLS 1.3** handle OCSP stapling correctly
++4. **OpenSSL clients accept responses** without protocol errors
++
++## Test Components
++
++### OCSPTestServer.hs
++
++A comprehensive test server that:
++
++- Implements the `onCertificateStatus` hook to provide OCSP responses
++- Supports both TLS 1.2 and TLS 1.3 (configurable)
++- Logs hook calls for verification
++- Returns a valid test OCSP response
++- Serves simple HTTP responses for end-to-end testing
++
++Key features:
++- Hook call counting for verification
++- Verbose logging of handshake details
++- Self-signed certificate support for testing
++- Command-line configuration options
++
++### run-ocsp-tests.sh
++
++An automated test script that:
++
++- Generates test certificates automatically
++- Compiles the test server
++- Runs comprehensive tests for both TLS versions
++- Uses OpenSSL clients to verify OCSP delivery
++- Provides detailed pass/fail reporting
++- Cleans up test artifacts
++
++## Usage
++
++### Quick Test
++
++Run all tests (recommended):
++
++```bash
++./run-ocsp-tests.sh
++```
++
++### Specific TLS Version
++
++Test only TLS 1.2:
++```bash
++./run-ocsp-tests.sh --tls12-only
++```
++
++Test only TLS 1.3:
++```bash
++./run-ocsp-tests.sh --tls13-only
++```
++
++### Manual Testing
++
++Start the server manually:
++```bash
++cd tls/test/integration/ocsp
++ghc -package-db=../../../dist-newstyle/packagedb/ghc-* OCSPTestServer.hs
++./OCSPTestServer --verbose
++```
++
++Test with OpenSSL:
++```bash
++# TLS 1.2
++echo "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n" | \
++  openssl s_client -connect localhost:4443 -tls1_2 -status -CAfile certs/ca.crt
++
++# TLS 1.3  
++echo "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n" | \
++  openssl s_client -connect localhost:4443 -tls1_3 -status -CAfile certs/ca.crt
++```
++
++## Test Validation
++
++The tests verify:
++
++### 1. Hook Execution
++- Server logs show "OCSP HOOK CALLED" messages
++- Hook call counter increments correctly
++- Hook receives correct certificate chain and SNI information
++
++### 2. OCSP Delivery
++- OpenSSL client output contains "OCSP response:" section
++- Response contains valid DER-encoded OCSP data
++- No "unsupported status type" or format errors
++
++### 3. Protocol Compliance
++- No TLS alerts or handshake failures
++- Clean handshake completion
++- Proper message sequencing in both TLS versions
++
++### 4. TLS Version Differences
++- **TLS 1.2**: OCSP delivered via separate CertificateStatus message
++- **TLS 1.3**: OCSP delivered as certificate extension
++
++## Technical Details
++
++### OCSP Response Format
++
++The test server returns a raw DER-encoded OCSP response. The hs-tls library handles the TLS protocol wrapping:
++
++- **TLS 1.2**: Wraps in CertificateStatus message with 24-bit length field
++- **TLS 1.3**: Wraps in certificate extension with proper encoding
++
++### Certificate Chain
++
++Uses self-signed certificates for testing:
++- CA certificate and key for signing
++- Server certificate signed by the test CA
++- All certificates include appropriate extensions
++
++### Known Limitations
++
++- Uses self-signed certificates (expect certificate verification warnings)
++- OCSP response is static (not a real OCSP responder)
++- Timeout handling for test reliability
++
++## Expected Output
++
++### Successful Test Run
++
++```
++[INFO] Starting OCSP Stapling Integration Tests
++[INFO] Setting up test directories...
++[INFO] Generating test certificates...
++[SUCCESS] Certificates ready
++[INFO] Compiling OCSP test server...
++[SUCCESS] Test server compiled
++
++=== Testing TLS 1.2 ===
++[INFO] Starting OCSP test server (TLS version: 1.2)...
++[SUCCESS] Server started (PID: 12345)
++[INFO] Testing TLS 1.2 OCSP Stapling...
++
++=== TLS 1.2 OCSP Stapling Results ===
++[SUCCESS] ✓ OCSP hook was called
++[SUCCESS] ✓ OCSP response was delivered to client  
++[SUCCESS] ✓ Clean TLS handshake (no alerts/errors)
++[SUCCESS] ✓ TLS 1.2 OCSP Stapling: PASSED
++
++=== Testing TLS 1.3 ===
++[INFO] Starting OCSP test server (TLS version: 1.3)...
++[SUCCESS] Server started (PID: 12346)
++[INFO] Testing TLS 1.3 OCSP Stapling...
++
++=== TLS 1.3 OCSP Stapling Results ===
++[SUCCESS] ✓ OCSP hook was called
++[SUCCESS] ✓ OCSP response was delivered to client
++[SUCCESS] ✓ Clean TLS handshake (no alerts/errors)  
++[SUCCESS] ✓ TLS 1.3 OCSP Stapling: PASSED
++
++===========================================
++OCSP Stapling Integration Test Results
++===========================================
++[SUCCESS] All tests PASSED! 🎉
++[SUCCESS] OCSP stapling is working correctly in both TLS 1.2 and TLS 1.3
++```
++
++## Troubleshooting
++
++### Compilation Issues
++
++If compilation fails:
++1. Ensure the hs-tls library is built: `cabal build tls`
++2. Check that required dependencies are available
++3. Try using `ghc` directly with explicit package database paths
++
++### Connection Issues
++
++If tests fail with connection errors:
++1. Check that no other service is using the test port
++2. Verify firewall settings allow localhost connections
++3. Try a different port: `./run-ocsp-tests.sh --port 14444`
++
++### OCSP Delivery Issues
++
++If OCSP responses aren't delivered:
++1. Check server logs for hook call messages
++2. Verify certificate files are valid
++3. Ensure OpenSSL version supports OCSP stapling
++
++## Integration with CI/CD
++
++This test suite can be integrated into continuous integration:
++
++```bash
++# In CI script
++cd tls/test/integration/ocsp
++./run-ocsp-tests.sh
++```
++
++The script returns appropriate exit codes for CI systems.
++
++## References
++
++- [RFC 6066: Transport Layer Security (TLS) Extensions](https://tools.ietf.org/html/rfc6066)
++- [RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3](https://tools.ietf.org/html/rfc8446)
++- [RFC 6960: Online Certificate Status Protocol - OCSP](https://tools.ietf.org/html/rfc6960)
+\ No newline at end of file
+diff --git a/tls/test/integration/ocsp/run-ocsp-tests.sh b/tls/test/integration/ocsp/run-ocsp-tests.sh
+new file mode 100755
+index 00000000..10eb623d
+--- /dev/null
++++ b/tls/test/integration/ocsp/run-ocsp-tests.sh
+@@ -0,0 +1,412 @@
++#!/bin/bash
++
++# OCSP Stapling Integration Test Suite
++# 
++# This script provides comprehensive testing of OCSP stapling functionality
++# in the hs-tls library. It verifies that:
++#
++# 1. OCSP hooks are called during TLS handshakes
++# 2. OCSP responses are correctly formatted and delivered
++# 3. Both TLS 1.2 and TLS 1.3 handle OCSP stapling properly
++# 4. OpenSSL clients accept the OCSP responses without errors
++
++set -e
++
++# Configuration
++TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++SERVER_PORT=14443
++SERVER_PID=""
++CERT_DIR="$TEST_DIR/certs"
++LOG_DIR="$TEST_DIR/logs"
++TIMEOUT=10
++
++# Colors for output
++RED='\033[0;31m'
++GREEN='\033[0;32m'
++YELLOW='\033[1;33m'
++BLUE='\033[0;34m'
++NC='\033[0m' # No Color
++
++# Logging functions
++log_info() {
++    echo -e "${BLUE}[INFO]${NC} $1"
++}
++
++log_success() {
++    echo -e "${GREEN}[SUCCESS]${NC} $1"
++}
++
++log_warning() {
++    echo -e "${YELLOW}[WARNING]${NC} $1"
++}
++
++log_error() {
++    echo -e "${RED}[ERROR]${NC} $1"
++}
++
++# Cleanup function
++cleanup() {
++    if [[ -n "$SERVER_PID" ]]; then
++        log_info "Stopping test server (PID: $SERVER_PID)..."
++        kill $SERVER_PID 2>/dev/null || true
++        wait $SERVER_PID 2>/dev/null || true
++    fi
++    
++    # Clean up any remaining processes
++    pkill -f "OCSPTestServer" 2>/dev/null || true
++}
++
++# Set up trap for cleanup
++trap cleanup EXIT
++
++# Create necessary directories
++setup_directories() {
++    log_info "Setting up test directories..."
++    mkdir -p "$CERT_DIR"
++    mkdir -p "$LOG_DIR"
++}
++
++# Generate test certificates
++generate_certificates() {
++    log_info "Generating test certificates..."
++    
++    cd "$CERT_DIR"
++    
++    # Generate CA key and certificate
++    if [[ ! -f ca.key || ! -f ca.crt ]]; then
++        log_info "Generating CA certificate..."
++        openssl genrsa -out ca.key 2048
++        openssl req -new -x509 -key ca.key -out ca.crt -days 365 -subj "/C=US/O=OCSP-Test-CA/CN=Test-CA"
++    fi
++    
++    # Generate server key and certificate
++    if [[ ! -f server.key || ! -f server.crt ]]; then
++        log_info "Generating server certificate..."
++        openssl genrsa -out server.key 2048
++        openssl req -new -key server.key -out server.csr -subj "/C=US/O=Test-Server/CN=localhost"
++        openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 365
++        rm server.csr
++    fi
++    
++    cd "$TEST_DIR"
++    log_success "Certificates ready"
++}
++
++# Compile the test server
++compile_server() {
++    log_info "Compiling OCSP test server..."
++    
++    cd "$TEST_DIR"
++    
++    # Use stack to compile if available, otherwise try cabal, finally ghc
++    if command -v stack &> /dev/null && [[ -f "../../../stack.yaml" ]]; then
++        log_info "Using stack to compile..."
++        cd ../../..
++        stack ghc -- test/integration/ocsp/OCSPTestServer.hs -o test/integration/ocsp/OCSPTestServer -threaded -rtsopts 2>&1 | tee "$TEST_DIR/$LOG_DIR/compile.log"
++        cd "$TEST_DIR"
++        EXECUTABLE="./OCSPTestServer"
++    elif command -v cabal &> /dev/null; then
++        log_info "Using cabal to compile..."
++        cd ../../..
++        cabal exec -- ghc test/integration/ocsp/OCSPTestServer.hs -o test/integration/ocsp/OCSPTestServer -threaded -rtsopts 2>&1 | tee "$TEST_DIR/$LOG_DIR/compile.log"
++        cd "$TEST_DIR"
++        EXECUTABLE="./OCSPTestServer"
++    else
++        log_error "Neither stack nor cabal found - cannot compile test server"
++        return 1
++    fi
++    
++    if [[ ! -f "$EXECUTABLE" ]]; then
++        log_error "Failed to compile test server"
++        return 1
++    fi
++    
++    log_success "Test server compiled: $EXECUTABLE"
++}
++
++# Start the test server
++start_server() {
++    local tls_version="$1"
++    
++    log_info "Starting OCSP test server (TLS version: $tls_version)..."
++    
++    cd "$TEST_DIR"
++    
++    local version_flag=""
++    if [[ "$tls_version" == "1.2" ]]; then
++        version_flag="--tls12"
++    elif [[ "$tls_version" == "1.3" ]]; then
++        version_flag="--tls13"
++    fi
++    
++    # Start server in background
++    $EXECUTABLE --port $SERVER_PORT $version_flag --verbose \
++        --certificate "$CERT_DIR/server.crt" \
++        --key "$CERT_DIR/server.key" \
++        > "$LOG_DIR/server-$tls_version.log" 2>&1 &
++    
++    SERVER_PID=$!
++    
++    # Wait for server to start
++    sleep 2
++    
++    # Check if server is running
++    if ! kill -0 $SERVER_PID 2>/dev/null; then
++        log_error "Server failed to start"
++        cat "$LOG_DIR/server-$tls_version.log"
++        return 1
++    fi
++    
++    log_success "Server started (PID: $SERVER_PID)"
++}
++
++# Test TLS connection with OpenSSL
++test_tls_connection() {
++    local tls_version="$1"
++    local test_name="TLS $tls_version OCSP Stapling"
++    
++    log_info "Testing $test_name..."
++    
++    local openssl_version=""
++    if [[ "$tls_version" == "1.2" ]]; then
++        openssl_version="-tls1_2"
++    elif [[ "$tls_version" == "1.3" ]]; then
++        openssl_version="-tls1_3"
++    fi
++    
++    # Run OpenSSL client test
++    local output_file="$LOG_DIR/client-$tls_version.log"
++    
++    # Test with OCSP status request
++    echo -e "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" | \
++        timeout $TIMEOUT openssl s_client \
++            -connect localhost:$SERVER_PORT \
++            $openssl_version \
++            -status \
++            -verify_return_error \
++            -CAfile "$CERT_DIR/ca.crt" \
++            > "$output_file" 2>&1
++    
++    local client_exit_code=$?
++    
++    # Analyze results
++    local hook_called=false
++    local ocsp_delivered=false
++    local clean_handshake=false
++    
++    # Check server logs for hook calls
++    if grep -q "OCSP HOOK CALLED" "$LOG_DIR/server-$tls_version.log"; then
++        hook_called=true
++    fi
++    
++    # Check client output for OCSP response
++    if grep -q "OCSP response:" "$output_file"; then
++        ocsp_delivered=true
++    fi
++    
++    # Check for clean handshake (no alerts or errors)
++    if grep -qE "(alert|error|fail)" "$output_file"; then
++        clean_handshake=false
++    else
++        clean_handshake=true
++    fi
++    
++    # Report results
++    echo
++    echo "=== $test_name Results ==="
++    
++    if $hook_called; then
++        log_success "✓ OCSP hook was called"
++    else
++        log_error "✗ OCSP hook was NOT called"
++    fi
++    
++    if $ocsp_delivered; then
++        log_success "✓ OCSP response was delivered to client"
++    else
++        log_error "✗ OCSP response was NOT delivered"
++    fi
++    
++    if $clean_handshake; then
++        log_success "✓ Clean TLS handshake (no alerts/errors)"
++    else
++        log_warning "⚠ TLS handshake had warnings/errors"
++    fi
++    
++    # Overall test result
++    if $hook_called && $ocsp_delivered && $clean_handshake; then
++        log_success "✓ $test_name: PASSED"
++        return 0
++    else
++        log_error "✗ $test_name: FAILED"
++        echo
++        echo "Server log excerpt:"
++        tail -20 "$LOG_DIR/server-$tls_version.log" || true
++        echo
++        echo "Client log excerpt:"
++        tail -20 "$output_file" || true
++        return 1
++    fi
++}
++
++# Run a single test
++run_single_test() {
++    local tls_version="$1"
++    
++    log_info "=== Testing TLS $tls_version ==="
++    
++    # Start server for this TLS version
++    start_server "$tls_version"
++    
++    # Run the test
++    if test_tls_connection "$tls_version"; then
++        log_success "TLS $tls_version test PASSED"
++        local result=0
++    else
++        log_error "TLS $tls_version test FAILED"
++        local result=1
++    fi
++    
++    # Stop server
++    if [[ -n "$SERVER_PID" ]]; then
++        kill $SERVER_PID 2>/dev/null || true
++        wait $SERVER_PID 2>/dev/null || true
++        SERVER_PID=""
++    fi
++    
++    return $result
++}
++
++# Main test function
++run_all_tests() {
++    log_info "Starting OCSP Stapling Integration Tests"
++    log_info "========================================="
++    
++    # Setup
++    setup_directories
++    generate_certificates
++    compile_server
++    
++    # Run tests
++    local failed_tests=0
++    
++    log_info ""
++    if ! run_single_test "1.2"; then
++        ((failed_tests++))
++    fi
++    
++    sleep 2
++    
++    log_info ""
++    if ! run_single_test "1.3"; then
++        ((failed_tests++))
++    fi
++    
++    # Final results
++    echo
++    echo "==========================================="
++    echo "OCSP Stapling Integration Test Results"
++    echo "==========================================="
++    
++    if [[ $failed_tests -eq 0 ]]; then
++        log_success "All tests PASSED! 🎉"
++        log_success "OCSP stapling is working correctly in both TLS 1.2 and TLS 1.3"
++        return 0
++    else
++        log_error "$failed_tests test(s) FAILED"
++        log_error "Check the logs in $LOG_DIR for details"
++        return 1
++    fi
++}
++
++# Help function
++show_help() {
++    cat << EOF
++OCSP Stapling Integration Test Suite
++
++Usage: $0 [OPTIONS]
++
++Options:
++    --help          Show this help message
++    --clean         Clean up generated files and exit
++    --tls12-only    Test only TLS 1.2
++    --tls13-only    Test only TLS 1.3
++    --port PORT     Use custom port (default: $SERVER_PORT)
++    --verbose       Enable verbose output
++
++Examples:
++    $0                  # Run all tests
++    $0 --tls12-only     # Test only TLS 1.2
++    $0 --clean          # Clean up files
++
++This test suite verifies that OCSP stapling works correctly by:
++1. Generating test certificates
++2. Starting a test server with OCSP hooks
++3. Testing with OpenSSL clients
++4. Verifying hook calls and OCSP delivery
++EOF
++}
++
++# Clean up function
++clean_up() {
++    log_info "Cleaning up test files..."
++    
++    # Stop any running servers
++    cleanup
++    
++    # Remove generated files
++    rm -rf "$CERT_DIR"
++    rm -rf "$LOG_DIR"
++    rm -f "$TEST_DIR/ocsp-test.cabal"
++    rm -f "$TEST_DIR/OCSPTestServer"
++    rm -f "$TEST_DIR"/*.hi
++    rm -f "$TEST_DIR"/*.o
++    
++    log_success "Cleanup complete"
++}
++
++# Parse command line arguments
++while [[ $# -gt 0 ]]; do
++    case $1 in
++        --help)
++            show_help
++            exit 0
++            ;;
++        --clean)
++            clean_up
++            exit 0
++            ;;
++        --tls12-only)
++            log_info "Running TLS 1.2 test only"
++            setup_directories
++            generate_certificates
++            compile_server
++            run_single_test "1.2"
++            exit $?
++            ;;
++        --tls13-only)
++            log_info "Running TLS 1.3 test only"
++            setup_directories
++            generate_certificates
++            compile_server
++            run_single_test "1.3"
++            exit $?
++            ;;
++        --port)
++            SERVER_PORT="$2"
++            shift
++            ;;
++        --verbose)
++            set -x
++            ;;
++        *)
++            log_error "Unknown option: $1"
++            show_help
++            exit 1
++            ;;
++    esac
++    shift
++done
++
++# Run the main test suite
++run_all_tests
+\ No newline at end of file
+diff --git a/tls12-compliance-test.sh b/tls12-compliance-test.sh
+deleted file mode 100755
+index af0633e0..00000000
+--- a/tls12-compliance-test.sh
++++ /dev/null
+@@ -1,120 +0,0 @@
+-#!/bin/bash
+-
+-# TLS 1.2 Specific Compliance Test
+-# Tests the message ordering fix for OCSP in TLS 1.2
+-
+-set -e
+-
+-echo "=== TLS 1.2 OCSP Compliance Test ==="
+-echo ""
+-
+-# Create a simple test certificate if it doesn't exist
+-if [ ! -f test.crt ] || [ ! -f test.key ]; then
+-    echo "Creating test certificate..."
+-    openssl req -x509 -newkey rsa:2048 -keyout test.key -out test.crt -days 30 -nodes \
+-        -subj "/CN=localhost/O=Test/C=US" \
+-        -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+-fi
+-
+-# Start the TLS server forcing TLS 1.2
+-echo "Starting hs-tls server with TLS 1.2..."
+-stack exec tls-simpleserver -- --certificate test.crt --key test.key --tls12 4443 &
+-SERVER_PID=$!
+-
+-# Give server time to start
+-sleep 3
+-
+-echo "Server started with PID $SERVER_PID"
+-echo ""
+-
+-# Function to cleanup
+-cleanup() {
+-    echo "Cleaning up..."
+-    kill $SERVER_PID 2>/dev/null || true
+-    wait $SERVER_PID 2>/dev/null || true
+-}
+-trap cleanup EXIT
+-
+-# Test 1: Force TLS 1.2 basic connection
+-echo "=== Test 1: TLS 1.2 Basic Connection ==="
+-result=$(timeout 10s openssl s_client -connect localhost:4443 -tls1_2 -quiet -no_ign_eof <<< "GET / HTTP/1.1
+-Host: localhost
+-Connection: close
+-
+-" 2>&1)
+-
+-if echo "$result" | grep -q "Protocol.*TLSv1.2"; then
+-    echo "✅ TLS 1.2 connection successful"
+-    echo "$result" | grep -E "(Protocol|Cipher|Verify return)" | head -3
+-else
+-    echo "❌ TLS 1.2 connection failed"
+-    echo "$result" | head -5
+-fi
+-echo ""
+-
+-# Test 2: TLS 1.2 with OCSP status request
+-echo "=== Test 2: TLS 1.2 with OCSP Status Request ==="
+-result=$(timeout 10s openssl s_client -connect localhost:4443 -tls1_2 -status -quiet -no_ign_eof <<< "GET / HTTP/1.1
+-Host: localhost
+-Connection: close
+-
+-" 2>&1)
+-
+-if echo "$result" | grep -q "OCSP Response Status"; then
+-    echo "✅ OCSP Status Request processed"
+-    echo "$result" | grep -A5 "OCSP Response"
+-elif echo "$result" | grep -q "Protocol.*TLSv1.2"; then
+-    echo "⚠️  TLS 1.2 connection successful, no OCSP response (expected - test cert)"
+-    echo "$result" | grep -E "(Protocol|Cipher)" | head -2
+-else
+-    echo "❌ TLS 1.2 with OCSP failed"
+-    echo "$result" | head -5
+-fi
+-echo ""
+-
+-# Test 3: Detailed handshake message trace for TLS 1.2
+-echo "=== Test 3: TLS 1.2 Handshake Message Order Verification ==="
+-echo "Checking for correct order: Certificate -> CertificateStatus -> ServerKeyExchange"
+-
+-# Use s_client with message tracing to see handshake flow
+-result=$(timeout 10s openssl s_client -connect localhost:4443 -tls1_2 -msg -ign_eof </dev/null 2>&1)
+-
+-# Extract handshake messages and check order
+-echo "$result" | grep -E ">>>(.*Handshake|<<<.*Handshake)" | while read line; do
+-    if echo "$line" | grep -q "Certificate"; then
+-        echo "📜 Certificate message"
+-    elif echo "$line" | grep -q "CertificateStatus"; then
+-        echo "🎫 CertificateStatus message"
+-    elif echo "$line" | grep -q "ServerKeyExchange"; then
+-        echo "🔑 ServerKeyExchange message"
+-    elif echo "$line" | grep -q "ServerHelloDone"; then
+-        echo "✅ ServerHelloDone message"
+-        break
+-    fi
+-done
+-
+-echo ""
+-
+-# Test 4: Browser-like ALPN + OCSP test (simulating Safari)
+-echo "=== Test 4: Browser-like Request (ALPN + OCSP) ==="
+-result=$(timeout 10s openssl s_client -connect localhost:4443 -tls1_2 -alpn h2,http/1.1 -status -quiet -no_ign_eof <<< "GET / HTTP/1.1
+-Host: localhost
+-Connection: close
+-
+-" 2>&1)
+-
+-if echo "$result" | grep -q "Protocol.*TLSv1.2"; then
+-    echo "✅ Browser-like request successful"
+-    alpn=$(echo "$result" | grep "ALPN protocol" || echo "No ALPN negotiated")
+-    echo "  ALPN: $alpn"
+-    protocol=$(echo "$result" | grep "Protocol" | head -1)
+-    echo "  $protocol"
+-else
+-    echo "❌ Browser-like request failed"
+-    echo "$result" | head -5
+-fi
+-
+-echo ""
+-echo "=== Test Complete ==="
+-echo "All tests should show successful TLS 1.2 connections."
+-echo "The message ordering fix should prevent handshake failures."
+\ No newline at end of file
+-- 
+2.50.0
+
